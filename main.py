@@ -2812,24 +2812,40 @@ class StockApp(MDApp):
         return lines
 
     def get_image_raster_data(self, image):
-        max_width = 576
+        max_width = 576 # عرض طابعة 80 ملم
         if image.width > max_width:
             ratio = max_width / float(image.width)
             new_height = int(image.height * ratio)
             image = image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            
         if image.width % 8 != 0:
             target_width = image.width // 8 * 8
             image = image.crop((0, 0, target_width, image.height))
+            
         image = image.convert('1')
         width, height = image.size
-        xL = width // 8 % 256
-        xH = width // 8 // 256
-        yL = height % 256
-        yH = height // 256
-        cmd = b'\x1dv0\x00' + bytes([xL, xH, yL, yH])
-        raw_bytes = image.tobytes()
-        inverted_bytes = bytearray([b ^ 255 for b in raw_bytes])
-        return cmd + inverted_bytes
+        bytes_per_row = width // 8
+        
+        band_height = 120 
+        chunks = []
+        
+        for y in range(0, height, band_height):
+            current_band_height = min(band_height, height - y)
+            band_image = image.crop((0, y, width, y + current_band_height))
+            
+            xL = bytes_per_row % 256
+            xH = bytes_per_row // 256
+            yL = current_band_height % 256
+            yH = current_band_height // 256
+            
+            cmd = b'\x1d\x76\x30\x00' + bytes([xL, xH, yL, yH])
+            
+            raw_bytes = band_image.tobytes()
+            inverted_bytes = bytearray([b ^ 255 for b in raw_bytes])
+            
+            chunks.append(cmd + inverted_bytes)
+            
+        return chunks
 
     def create_receipt_image(self, transaction_data):
         PAPER_WIDTH = 576
@@ -3083,32 +3099,40 @@ class StockApp(MDApp):
             if not adapter or not adapter.isEnabled():
                 self.notify('Bluetooth désactivé', 'error')
                 return
+                
             device = adapter.getRemoteDevice(target_mac)
             uuid = UUID.fromString('00001101-0000-1000-8000-00805F9B34FB')
+            
             img = self.create_receipt_image(transaction_data)
-            raster_data = self.get_image_raster_data(img)
+            raster_chunks = self.get_image_raster_data(img)
+            
             socket = device.createRfcommSocketToServiceRecord(uuid)
             socket.connect()
-            time.sleep(0.2)
+            time.sleep(0.3)
             output_stream = socket.getOutputStream()
+            
             ESC = b'\x1b'
             GS = b'\x1d'
             INIT = ESC + b'@'
-            CUT = GS + b'V\x00'
+            
             output_stream.write(INIT)
             output_stream.flush()
             time.sleep(0.1)
-            chunk_size = 1024
-            total_size = len(raster_data)
-            for i in range(0, total_size, chunk_size):
-                chunk = raster_data[i:i + chunk_size]
+            
+            for chunk in raster_chunks:
                 output_stream.write(chunk)
                 output_stream.flush()
-                time.sleep(0.03)
-            output_stream.write(b'\n\n')
+                time.sleep(0.15) 
+                
+            output_stream.write(b'\n\n\n\n\n')
+            output_stream.flush()
+            time.sleep(0.2)
+            
+            CUT = GS + b'V\x00'
             output_stream.write(CUT)
             output_stream.flush()
             time.sleep(0.5)
+            
             socket.close()
         except Exception as e:
             try:
