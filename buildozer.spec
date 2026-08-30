@@ -4,7 +4,7 @@ package.name = magpromobile
 package.domain = org.magpromobile
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json,ttf
-version = 7.5.0
+version = 7.9.0
 requirements = python3,kivy,kivymd==1.2.0,requests,urllib3,pillow,arabic-reshaper,python-bidi==0.4.2,six,future,certifi,chardet,idna,pyzbar,libzbar,fpdf2,fonttools==4.38.0,defusedxml,openpyxl,et_xmlfile,jdcal,android,jnius
 icon.filename = apk_icon.png
 orientation = portrait
