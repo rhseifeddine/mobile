@@ -7,6 +7,8 @@ source.include_exts = py,png,jpg,kv,atlas,json,ttf
 version = 8.1.0
 requirements = python3,kivy,kivymd==1.2.0,requests,urllib3,pillow,arabic-reshaper,python-bidi==0.4.2,six,future,certifi,chardet,idna,pyzbar,libzbar,fpdf2,fonttools==4.38.0,defusedxml,openpyxl,et_xmlfile,jdcal,android,jnius
 icon.filename = apk_icon.png
+presplash.filename = %(source.dir)s/apk_icon.png
+android.presplash_color = #FFFFFF
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET, ACCESS_NETWORK_STATE, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE, BLUETOOTH, BLUETOOTH_ADMIN, BLUETOOTH_CONNECT, BLUETOOTH_SCAN, ACCESS_COARSE_LOCATION, ACCESS_FINE_LOCATION,CAMERA
