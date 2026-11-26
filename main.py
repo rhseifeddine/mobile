@@ -7547,14 +7547,27 @@ class StockApp(MDApp):
                 pass
             self.notify("Erreur d'impression Bluetooth.", 'error')
 
-    # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
     # 7.12 SCANNER CODE-BARRES CAMÉRA (SIMPLE & CONTINU)
     # --------------------------------------------------------------------------
     def open_barcode_scanner(self, instance):
         self.temp_scanned_cart = []
         self.potential_code = None
         self.consecutive_frames = 0
-        self.last_scan_time = 0
+        self._consensus_ts = 0.0
+        self.last_scan_time = 0.0
+        self._last_any_scan_time = 0.0
+        self._recent_scan_times = {}
+        self._frame_scan_tick = 0
+        self.is_detecting_frame = False
+        self.is_scanner_paused = False
+        self.scanner_sound_enabled = getattr(self, 'scanner_sound_enabled', True)
+        self._current_zoom = 1.0
+        self._zoom_initialized = False
+        self._zoom_ratios = []
+        self._torch_active = False
+        self._torch_supported = False
+        self._scanner_session_id = getattr(self, '_scanner_session_id', 0) + 1
         if instance is not None:
             self.target_scan_field = None
         if not zbar_decode:
@@ -7569,13 +7582,251 @@ class StockApp(MDApp):
         else:
             self._launch_camera_widget()
 
-    def _launch_camera_widget(self):
-        self.scanner_start_time = time.time()
+    def _get_retail_zbar_symbols(self):
+        if hasattr(self, '_cached_zbar_symbols'):
+            return self._cached_zbar_symbols
         try:
-            self.camera_widget = Camera(play=True, index=0, resolution=(640, 480), allow_stretch=True, keep_ratio=False)
+            from pyzbar.pyzbar import ZBarSymbol
+            syms = []
+            for name in ('EAN13', 'EAN8', 'UPCA', 'UPCE', 'CODE128', 'CODE39', 'CODE93', 'I25', 'CODABAR', 'QRCODE'):
+                sym = getattr(ZBarSymbol, name, None)
+                if sym is not None:
+                    syms.append(sym)
+            self._cached_zbar_symbols = syms if syms else None
+        except Exception:
+            self._cached_zbar_symbols = None
+        return self._cached_zbar_symbols
+
+    def _get_android_camera(self):
+        if platform != 'android' or not getattr(self, 'camera_widget', None):
+            return None
+        try:
+            cam_core = getattr(self.camera_widget, '_camera', None)
+            if cam_core is None:
+                return None
+            return getattr(cam_core, '_android_camera', None) or getattr(cam_core, '_camera', None)
+        except Exception:
+            return None
+
+    def _optimize_camera_params(self):
+        if not getattr(self, 'scan_dialog', None) or not self.scan_dialog.parent:
+            return
+        acam = self._get_android_camera()
+        if acam is None:
+            return
+        try:
+            params = acam.getParameters()
+            if params is None:
+                return
+
+            try:
+                f_modes = params.getSupportedFocusModes()
+                if f_modes is not None:
+                    modes_list = [str(m) for m in f_modes.toArray()]
+                    if 'continuous-picture' in modes_list:
+                        params.setFocusMode('continuous-picture')
+                    elif 'continuous-video' in modes_list:
+                        params.setFocusMode('continuous-video')
+                    elif 'auto' in modes_list:
+                        params.setFocusMode('auto')
+            except Exception:
+                pass
+
+            try:
+                if params.isZoomSupported():
+                    ratios_raw = params.getZoomRatios()
+                    if ratios_raw is not None:
+                        self._zoom_ratios = [int(r) for r in ratios_raw.toArray()]
+                    else:
+                        self._zoom_ratios = []
+                    if not self._zoom_initialized:
+                        self._zoom_initialized = True
+                        default_idx = 0
+                        for idx, r_val in enumerate(self._zoom_ratios):
+                            if r_val >= 100:
+                                default_idx = idx
+                                break
+                        try:
+                            params.setZoom(default_idx)
+                            self._current_zoom = (self._zoom_ratios[default_idx] / 100.0) if self._zoom_ratios else 1.0
+                        except Exception:
+                            self._current_zoom = 1.0
+                    if getattr(self, 'btn_scan_zoom', None):
+                        if self._zoom_ratios and max(self._zoom_ratios) >= 150:
+                            self.btn_scan_zoom.opacity = 1
+                            self.btn_scan_zoom.disabled = False
+                            z_val = self._current_zoom
+                            self.btn_scan_zoom.text = f'{int(z_val)}x' if float(z_val).is_integer() else f'{z_val:.1f}x'
+                        else:
+                            self.btn_scan_zoom.opacity = 0
+                            self.btn_scan_zoom.disabled = True
+                elif getattr(self, 'btn_scan_zoom', None):
+                    self.btn_scan_zoom.opacity = 0
+                    self.btn_scan_zoom.disabled = True
+            except Exception:
+                pass
+
+            try:
+                fl_modes = params.getSupportedFlashModes()
+                fl_list = [str(m) for m in fl_modes.toArray()] if fl_modes is not None else []
+                self._torch_supported = 'torch' in fl_list
+                if getattr(self, 'btn_scan_torch', None):
+                    self.btn_scan_torch.opacity = 1 if self._torch_supported else 0
+                    self.btn_scan_torch.disabled = not self._torch_supported
+            except Exception:
+                pass
+
+            acam.setParameters(params)
+        except Exception:
+            pass
+
+    def _trigger_tap_to_focus(self, touch_pos):
+        if getattr(self, 'is_scanner_paused', False):
+            return
+        if getattr(self, '_focus_ring_line', None) and getattr(self, '_focus_ring_color', None):
+            self._focus_ring_line.circle = (touch_pos[0], touch_pos[1], dp(26))
+            self._focus_ring_color.a = 1.0
+            if getattr(self, '_focus_ring_ev', None):
+                self._focus_ring_ev.cancel()
+            self._focus_ring_ev = Clock.schedule_once(
+                lambda dt: setattr(self._focus_ring_color, 'a', 0.0) if getattr(self, '_focus_ring_color', None) else None,
+                0.55,
+            )
+
+        acam = self._get_android_camera()
+        if acam is None:
+            return
+        try:
+            params = acam.getParameters()
+            if params is None:
+                return
+            f_modes = params.getSupportedFocusModes()
+            modes_list = [str(m) for m in f_modes.toArray()] if f_modes is not None else []
+            if 'auto' in modes_list:
+                params.setFocusMode('auto')
+                acam.setParameters(params)
+            acam.autoFocus(None)
+
+            def _restore_cont(dt):
+                c_obj = self._get_android_camera()
+                if c_obj is None:
+                    return
+                try:
+                    p2 = c_obj.getParameters()
+                    fm2 = p2.getSupportedFocusModes()
+                    ml2 = [str(m) for m in fm2.toArray()] if fm2 is not None else []
+                    if 'continuous-picture' in ml2:
+                        p2.setFocusMode('continuous-picture')
+                        c_obj.setParameters(p2)
+                except Exception:
+                    pass
+
+            Clock.schedule_once(_restore_cont, 0.65)
+        except Exception:
+            pass
+
+    def _toggle_camera_zoom(self, instance=None):
+        acam = self._get_android_camera()
+        if acam is None or not getattr(self, '_zoom_ratios', None):
+            return
+        try:
+            params = acam.getParameters()
+            if params is None or not params.isZoomSupported():
+                return
+            max_ratio = max(self._zoom_ratios)
+            if self._current_zoom < 1.4:
+                target = min(1.5, max_ratio / 100.0)
+            elif self._current_zoom < 1.9 and max_ratio >= 200:
+                target = 2.0
+            elif self._current_zoom < 2.8 and max_ratio >= 300:
+                target = 3.0
+            else:
+                target = 1.0
+
+            target_hundred = int(round(target * 100))
+            best_idx = 0
+            best_diff = 999999
+            for idx, r_val in enumerate(self._zoom_ratios):
+                d = abs(r_val - target_hundred)
+                if d < best_diff:
+                    best_diff = d
+                    best_idx = idx
+
+            params.setZoom(best_idx)
+            acam.setParameters(params)
+            self._current_zoom = target
+            if getattr(self, 'btn_scan_zoom', None):
+                self.btn_scan_zoom.text = f'{int(target)}x' if float(target).is_integer() else f'{target:.1f}x'
+                self.btn_scan_zoom.md_bg_color = (0.15, 0.45, 0.85, 0.85) if target > 1.0 else (0.15, 0.15, 0.18, 0.75)
+        except Exception:
+            pass
+
+    def _toggle_camera_torch(self, instance=None):
+        if not getattr(self, '_torch_supported', False):
+            self.notify('Flash non disponible', 'warning')
+            return
+        acam = self._get_android_camera()
+        if acam is None:
+            return
+        try:
+            params = acam.getParameters()
+            if params is None:
+                return
+            self._torch_active = not getattr(self, '_torch_active', False)
+            params.setFlashMode('torch' if self._torch_active else 'off')
+            acam.setParameters(params)
+            if getattr(self, 'btn_scan_torch', None):
+                self.btn_scan_torch.icon = 'flashlight' if self._torch_active else 'flashlight-off'
+                self.btn_scan_torch.md_bg_color = (0.95, 0.65, 0.05, 0.9) if self._torch_active else (0.15, 0.15, 0.18, 0.75)
+        except Exception:
+            self._torch_active = False
+            self.notify('Flash non disponible', 'warning')
+
+    def _toggle_scanner_sound(self, instance=None):
+        self.scanner_sound_enabled = not getattr(self, 'scanner_sound_enabled', True)
+        if getattr(self, 'btn_scan_sound', None):
+            self.btn_scan_sound.icon = 'volume-high' if self.scanner_sound_enabled else 'volume-off'
+            self.btn_scan_sound.md_bg_color = (0.15, 0.45, 0.85, 0.85) if self.scanner_sound_enabled else (0.15, 0.15, 0.18, 0.75)
+
+    def _toggle_camera_pause(self, instance=None):
+        if not getattr(self, 'camera_widget', None):
+            return
+        self.is_scanner_paused = not getattr(self, 'is_scanner_paused', False)
+        if self.is_scanner_paused:
+            if getattr(self, '_torch_active', False):
+                self._toggle_camera_torch()
+            self.camera_widget.play = False
+            self.potential_code = None
+            self.consecutive_frames = 0
+            if getattr(self, 'btn_scan_pause', None):
+                self.btn_scan_pause.icon = 'play'
+                self.btn_scan_pause.md_bg_color = (0.05, 0.65, 0.35, 0.9)
+            if getattr(self, '_laser_color', None):
+                self._laser_color.a = 0.0
+        else:
+            self.scanner_start_time = time.time()
+            self.camera_widget.play = True
+            self._zoom_initialized = False
+            if getattr(self, 'btn_scan_pause', None):
+                self.btn_scan_pause.icon = 'pause'
+                self.btn_scan_pause.md_bg_color = (0.15, 0.15, 0.18, 0.75)
+            if getattr(self, '_laser_color', None):
+                self._laser_color.a = 0.95
+            Clock.schedule_once(lambda dt: self._optimize_camera_params(), 0.4)
+
+    def _launch_camera_widget(self):
+        from kivy.graphics import Color, Line, Rectangle
+        self.scanner_start_time = time.time()
+        self._laser_phase = 0.0
+        self._laser_dir = 1.0
+        try:
+            try:
+                self.camera_widget = Camera(play=True, index=0, resolution=(1280, 720), allow_stretch=True, keep_ratio=False)
+            except Exception:
+                self.camera_widget = Camera(play=True, index=0, resolution=(640, 480), allow_stretch=True, keep_ratio=False)
             with self.camera_widget.canvas.before:
                 PushMatrix()
-                self.rotation = Rotate(angle=-90, origin=self.camera_widget.center)
+                self.rotation = Rotate(angle=-90 if platform == 'android' else 0, origin=self.camera_widget.center)
             with self.camera_widget.canvas.after:
                 PopMatrix()
             self.camera_widget.bind(center=lambda i, v: setattr(self.rotation, 'origin', i.center))
@@ -7585,15 +7836,83 @@ class StockApp(MDApp):
 
         is_single = getattr(self, 'target_scan_field', None) is not None
         root = MDBoxLayout(orientation='vertical')
-        cam_area = MDFloatLayout(size_hint_y=1.0 if is_single else 0.55)
+        cam_area = MDFloatLayout(size_hint_y=0.90 if is_single else 0.48)
+        self.cam_area_ref = cam_area
         self.camera_widget.size_hint = (1, 1)
         cam_area.add_widget(self.camera_widget)
-        cam_area.add_widget(MDIconButton(icon='close', icon_size='36sp', md_bg_color=(0, 0, 0, 0.5), theme_text_color='Custom', text_color=(1, 1, 1, 1), pos_hint={'top': 0.96, 'right': 0.96}, on_release=self.close_barcode_scanner))
+
+        with cam_area.canvas.after:
+            self._scan_box_color = Color(0.20, 0.83, 0.60, 0.92)
+            self._scan_box_line = Line(rounded_rectangle=(0, 0, 100, 100, dp(10)), width=dp(2.2))
+            self._laser_color = Color(0.94, 0.27, 0.27, 0.95)
+            self._laser_rect = Rectangle(pos=(0, 0), size=(100, dp(2)))
+            self._focus_ring_color = Color(0.98, 0.75, 0.14, 0.0)
+            self._focus_ring_line = Line(circle=(0, 0, dp(26)), width=dp(2))
+
+        cam_area.bind(pos=self._update_scan_overlay_geometry, size=self._update_scan_overlay_geometry)
+
+        def _on_cam_touch(inst, touch):
+            if not inst.collide_point(*touch.pos):
+                return False
+            for ctrl in (
+                getattr(self, 'btn_scan_close', None),
+                getattr(self, 'btn_scan_sound', None),
+                getattr(self, 'btn_scan_zoom', None),
+                getattr(self, 'btn_scan_torch', None),
+                getattr(self, 'btn_scan_pause', None),
+            ):
+                if ctrl and not ctrl.disabled and ctrl.opacity > 0 and ctrl.collide_point(*touch.pos):
+                    return False
+            self._trigger_tap_to_focus(touch.pos)
+            return True
+
+        cam_area.bind(on_touch_down=_on_cam_touch)
+
+        self.btn_scan_close = MDIconButton(
+            icon='close', icon_size='28sp',
+            md_bg_color=(0.8, 0.15, 0.15, 0.85), theme_text_color='Custom', text_color=(1, 1, 1, 1),
+            pos_hint={'top': 0.96, 'right': 0.97}, on_release=self.close_barcode_scanner,
+        )
+        self.btn_scan_sound = MDIconButton(
+            icon='volume-high' if self.scanner_sound_enabled else 'volume-off', icon_size='24sp',
+            md_bg_color=(0.15, 0.45, 0.85, 0.85) if self.scanner_sound_enabled else (0.15, 0.15, 0.18, 0.75),
+            theme_text_color='Custom', text_color=(1, 1, 1, 1),
+            pos_hint={'top': 0.96, 'x': 0.03}, on_release=self._toggle_scanner_sound,
+        )
+        self.btn_scan_pause = MDIconButton(
+            icon='pause', icon_size='24sp',
+            md_bg_color=(0.15, 0.15, 0.18, 0.75), theme_text_color='Custom', text_color=(1, 1, 1, 1),
+            pos_hint={'y': 0.04, 'right': 0.97}, on_release=self._toggle_camera_pause,
+        )
+        self.btn_scan_torch = MDIconButton(
+            icon='flashlight-off', icon_size='24sp',
+            md_bg_color=(0.15, 0.15, 0.18, 0.75), theme_text_color='Custom', text_color=(1, 1, 1, 1),
+            pos_hint={'y': 0.04, 'x': 0.03}, opacity=0, disabled=True, on_release=self._toggle_camera_torch,
+        )
+        self.btn_scan_zoom = MDRaisedButton(
+            text='1x', font_size='14sp', elevation=0,
+            md_bg_color=(0.15, 0.15, 0.18, 0.75), text_color=(1, 1, 1, 1),
+            size_hint=(None, None), size=(dp(56), dp(40)),
+            pos_hint={'y': 0.04, 'center_x': 0.5}, opacity=0, disabled=True, on_release=self._toggle_camera_zoom,
+        )
+        cam_area.add_widget(self.btn_scan_close)
+        cam_area.add_widget(self.btn_scan_sound)
+        cam_area.add_widget(self.btn_scan_pause)
+        cam_area.add_widget(self.btn_scan_torch)
+        cam_area.add_widget(self.btn_scan_zoom)
         root.add_widget(cam_area)
 
+        manual_bar = MDCard(orientation='horizontal', size_hint_y=None, height=dp(58), padding=[dp(10), dp(4)], spacing=dp(8), radius=[0], elevation=0, md_bg_color=(0.97, 0.98, 0.99, 1))
+        self.scan_manual_field = MDTextField(hint_text='Saisir le code-barres...', mode='rectangle', multiline=False, size_hint_x=0.75, font_size='16sp', pos_hint={'center_y': 0.5})
+        self.scan_manual_field.bind(on_text_validate=lambda x: self._handle_manual_scan_submit())
+        manual_btn = MDRaisedButton(text='OK', size_hint_x=0.25, size_hint_y=None, height=dp(44), md_bg_color=(0.1, 0.45, 0.85, 1), text_color=(1, 1, 1, 1), pos_hint={'center_y': 0.5}, on_release=lambda x: self._handle_manual_scan_submit())
+        manual_bar.add_widget(self.scan_manual_field)
+        manual_bar.add_widget(manual_btn)
+        root.add_widget(manual_bar)
+
         if not is_single:
-            box = MDCard(orientation='vertical', size_hint_y=0.45, radius=[20, 20, 0, 0], md_bg_color=(1, 1, 1, 1), elevation=0)
-            hdr = MDBoxLayout(size_hint_y=None, height=dp(40), padding=[dp(20), 0])
+            box = MDCard(orientation='vertical', size_hint_y=0.52, radius=[16, 16, 0, 0], md_bg_color=(1, 1, 1, 1), elevation=0)
+            hdr = MDBoxLayout(size_hint_y=None, height=dp(36), padding=[dp(16), 0])
             self.lbl_scan_count = MDLabel(text='Articles scannés : 0', bold=True, theme_text_color='Primary')
             hdr.add_widget(self.lbl_scan_count)
             box.add_widget(hdr)
@@ -7601,79 +7920,316 @@ class StockApp(MDApp):
             self.scan_list_widget = MDList()
             scr.add_widget(self.scan_list_widget)
             box.add_widget(scr)
-            box.add_widget(MDRaisedButton(text='TERMINER', font_size='18sp', size_hint=(1, None), height=dp(55), md_bg_color=(0, 0.7, 0.2, 1), elevation=0, on_release=self.finish_continuous_scan))
+            box.add_widget(MDRaisedButton(text='TERMINER', font_size='18sp', size_hint=(1, None), height=dp(52), md_bg_color=(0, 0.7, 0.2, 1), elevation=0, on_release=self.finish_continuous_scan))
             root.add_widget(box)
 
         self.scan_dialog = ModalView(size_hint=(1, 1), auto_dismiss=False, background_color=(0, 0, 0, 1))
         self.scan_dialog.add_widget(root)
         self.scan_dialog.open()
+        Clock.schedule_once(lambda dt: self._update_scan_overlay_geometry(), 0.05)
+        Clock.schedule_once(lambda dt: self._optimize_camera_params(), 0.35)
+        Clock.schedule_once(lambda dt: self._optimize_camera_params(), 0.90)
+        self._laser_ev = Clock.schedule_interval(self._animate_laser_step, 1.0 / 30.0)
         self.scan_event = Clock.schedule_interval(self.detect_barcode_frame, 1.0 / 20.0)
 
+    def _update_scan_overlay_geometry(self, *args):
+        cam_area = getattr(self, 'cam_area_ref', None)
+        if not cam_area or not getattr(self, '_scan_box_line', None):
+            return
+        x, y = cam_area.pos
+        w, h = cam_area.size
+        box_w = max(dp(40), w * 0.84)
+        box_h = max(dp(40), h * 0.56)
+        box_x = x + (w - box_w) / 2.0
+        box_y = y + (h - box_h) / 2.0
+        self._scan_box_rect = (box_x, box_y, box_w, box_h)
+        self._scan_box_line.rounded_rectangle = (box_x, box_y, box_w, box_h, dp(10))
+        if getattr(self, '_laser_rect', None):
+            ly = box_y + dp(8) + max(0.0, (box_h - dp(16))) * getattr(self, '_laser_phase', 0.5)
+            self._laser_rect.pos = (box_x + dp(8), ly)
+            self._laser_rect.size = (max(dp(10), box_w - dp(16)), dp(2))
+
+    def _animate_laser_step(self, dt):
+        if getattr(self, 'is_scanner_paused', False) or not getattr(self, '_laser_rect', None):
+            return
+        rect = getattr(self, '_scan_box_rect', None)
+        if not rect:
+            return
+        box_x, box_y, box_w, box_h = rect
+        step = dt * 1.25 * getattr(self, '_laser_dir', 1.0)
+        phase = getattr(self, '_laser_phase', 0.0) + step
+        if phase >= 1.0:
+            phase = 1.0
+            self._laser_dir = -1.0
+        elif phase <= 0.0:
+            phase = 0.0
+            self._laser_dir = 1.0
+        self._laser_phase = phase
+        ly = box_y + dp(8) + max(0.0, (box_h - dp(16))) * phase
+        self._laser_rect.pos = (box_x + dp(8), ly)
+        self._laser_rect.size = (max(dp(10), box_w - dp(16)), dp(2))
+
+    def _flash_scan_frame(self, is_success: bool):
+        if not getattr(self, '_scan_box_color', None):
+            return
+        if getattr(self, '_flash_reset_ev', None):
+            self._flash_reset_ev.cancel()
+        self._scan_box_color.rgba = (0.06, 0.72, 0.50, 1.0) if is_success else (0.94, 0.27, 0.27, 1.0)
+        self._flash_reset_ev = Clock.schedule_once(
+            lambda dt: setattr(self._scan_box_color, 'rgba', (0.20, 0.83, 0.60, 0.92)) if getattr(self, '_scan_box_color', None) else None,
+            0.46,
+        )
+
     def close_barcode_scanner(self, *args):
-        if getattr(self, 'scan_event', None):
-            self.scan_event.cancel()
-            self.scan_event = None
+        self._scanner_session_id = getattr(self, '_scanner_session_id', 0) + 1
+        for ev_attr in ('scan_event', '_laser_ev', '_flash_reset_ev', '_focus_ring_ev'):
+            ev = getattr(self, ev_attr, None)
+            if ev is not None:
+                ev.cancel()
+                setattr(self, ev_attr, None)
+        if getattr(self, '_torch_active', False):
+            acam = self._get_android_camera()
+            if acam is not None:
+                try:
+                    params = acam.getParameters()
+                    if params is not None:
+                        params.setFlashMode('off')
+                        acam.setParameters(params)
+                except Exception:
+                    pass
+            self._torch_active = False
         if getattr(self, 'camera_widget', None):
             self.camera_widget.play = False
         if getattr(self, 'scan_dialog', None):
             self.scan_dialog.dismiss()
             self.scan_dialog = None
+        self.cam_area_ref = None
+        self._scan_box_color = None
+        self._scan_box_line = None
+        self._laser_color = None
+        self._laser_rect = None
+        self._focus_ring_color = None
+        self._focus_ring_line = None
+        self.is_detecting_frame = False
+        self.is_scanner_paused = False
         self.temp_scanned_cart = []
         self.target_scan_field = None
 
     def detect_barcode_frame(self, dt):
         if not getattr(self, 'scan_dialog', None) or not self.scan_dialog.parent:
             return
+        if getattr(self, 'is_scanner_paused', False) or getattr(self, 'is_detecting_frame', False):
+            return
         if not getattr(self, 'camera_widget', None) or not self.camera_widget.texture:
             return
-        if time.time() - getattr(self, 'scanner_start_time', 0) < 1.2:
+        if time.time() - getattr(self, 'scanner_start_time', 0) < 0.8:
             return
         try:
             tex = self.camera_widget.texture
-            img = Image.frombytes(mode='RGBA', size=tex.size, data=tex.pixels).convert('L')
-            bcs = zbar_decode(img)
-            if bcs:
-                code = bcs[0].data.decode('utf-8').strip()
-                if code == self.potential_code:
-                    self.consecutive_frames += 1
-                else:
-                    self.potential_code = code
-                    self.consecutive_frames = 1
-                if self.consecutive_frames >= 2 and (time.time() - self.last_scan_time > 1.5):
-                    self.last_scan_time = time.time()
-                    self.consecutive_frames = 0
-                    self.potential_code = None
-                    Clock.schedule_once(lambda dt: self.process_continuous_scan(code))
-            else:
-                self.consecutive_frames = 0
+            raw_pixels = bytes(tex.pixels)
+            tex_size = tuple(tex.size)
+            color_fmt = str(getattr(tex, 'colorfmt', 'rgba') or 'rgba').upper()
+            if not raw_pixels or tex_size[0] <= 0 or tex_size[1] <= 0:
+                return
+            self.is_detecting_frame = True
+            sid = getattr(self, '_scanner_session_id', 0)
+            threading.Thread(
+                target=self._decode_frame_worker,
+                args=(raw_pixels, tex_size, color_fmt, sid),
+                daemon=True,
+            ).start()
+        except Exception:
+            self.is_detecting_frame = False
+
+    def _detect_frame_target(self, img: Image.Image) -> tuple:
+        vw, vh = img.size
+        self._frame_scan_tick = getattr(self, '_frame_scan_tick', 0) + 1
+        if vw < 400 or vh < 300 or (self._frame_scan_tick % 4 == 0):
+            return img, False
+        sx = int(vw * 0.02)
+        sy = int(vh * 0.16)
+        ex = max(sx + 160, int(vw * 0.98))
+        ey = max(sy + 120, int(vh * 0.84))
+        return img.crop((sx, sy, min(vw, ex), min(vh, ey))), True
+
+    def _pick_best_detected_code(self, bcs, is_roi: bool, surf_w: int, surf_h: int):
+        if not bcs:
+            return None
+        center_x = surf_w / 2.0
+        center_y = surf_h / 2.0
+        best = None
+        best_dist = float('inf')
+
+        for b in bcs:
+            raw_data = getattr(b, 'data', None)
+            if not raw_data:
+                continue
+            rect = getattr(b, 'rect', None)
+            if rect and rect.width > 0 and rect.height > 0:
+                if rect.width < 20 or rect.height < 10:
+                    continue
+                if is_roi and surf_w > 0 and surf_h > 0:
+                    if rect.left < 4 or rect.top < 4 or (rect.left + rect.width) > (surf_w - 4) or (rect.top + rect.height) > (surf_h - 4):
+                        continue
+                bx = rect.left + rect.width / 2.0
+                by = rect.top + rect.height / 2.0
+                dist = math.hypot(bx - center_x, by - center_y)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = b
+            elif best is None:
+                best = b
+
+        if best is None:
+            return None
+        code_str = best.data.decode('utf-8', errors='ignore').strip()
+        fmt_str = str(getattr(best, 'type', '') or '')
+        return (code_str, fmt_str) if code_str else None
+
+    def _decode_frame_worker(self, raw_pixels: bytes, tex_size: tuple, color_fmt: str, session_id: int):
+        try:
+            if session_id != getattr(self, '_scanner_session_id', 0):
+                return
+            mode = 'RGB' if color_fmt == 'RGB' else 'RGBA'
+            img = Image.frombytes(mode=mode, size=tex_size, data=raw_pixels).convert('L')
+            if platform == 'android':
+                img = img.transpose(Image.ROTATE_270)
+            target_img, is_roi = self._detect_frame_target(img)
+            symbols = self._get_retail_zbar_symbols()
+            bcs = zbar_decode(target_img, symbols=symbols) if symbols else zbar_decode(target_img)
+            picked = self._pick_best_detected_code(bcs, is_roi, target_img.size[0], target_img.size[1])
+            if picked and session_id == getattr(self, '_scanner_session_id', 0):
+                code_str, fmt_str = picked
+                Clock.schedule_once(lambda dt, c=code_str, f=fmt_str, sid=session_id: self._on_barcode_detected(c, f, sid), 0)
         except Exception:
             pass
+        finally:
+            self.is_detecting_frame = False
+
+    def _evaluate_retail_code(self, code: str, format_str: str) -> dict:
+        if not code or len(code) < 2 or len(code) > 64:
+            return {'valid': False, 'checksum_ok': False, 'is_qr': False, 'is_weak_1d': False}
+        fmt = str(format_str or '').lower()
+        if 'qr' in fmt:
+            return {'valid': True, 'checksum_ok': True, 'is_qr': True, 'is_weak_1d': False}
+        if fmt in ('upce', 'upc_e', 'upc-e'):
+            return {'valid': code.isdigit() and len(code) in (6, 8), 'checksum_ok': False, 'is_qr': False, 'is_weak_1d': False}
+
+        is_weak_1d = any(k in fmt for k in ('i25', 'itf', 'codabar', 'code39', 'code_39'))
+        if code.isdigit() and len(code) in (8, 12, 13, 14):
+            digits = [int(ch) for ch in code]
+            check = digits[-1]
+            total = 0
+            pos_from_right = 1
+            for i in range(len(digits) - 2, -1, -1):
+                total += digits[i] * (3 if pos_from_right % 2 == 1 else 1)
+                pos_from_right += 1
+            expected = (10 - (total % 10)) % 10
+            matched = check == expected
+            if 'ean' in fmt or 'upc' in fmt:
+                return {'valid': matched, 'checksum_ok': matched, 'is_qr': False, 'is_weak_1d': False}
+            return {'valid': True, 'checksum_ok': matched and len(code) in (8, 12, 13), 'is_qr': False, 'is_weak_1d': is_weak_1d}
+        return {'valid': True, 'checksum_ok': False, 'is_qr': False, 'is_weak_1d': is_weak_1d}
+
+    def _on_barcode_detected(self, raw_code: str, format_str: str, session_id: int):
+        if session_id != getattr(self, '_scanner_session_id', 0):
+            return
+        if not getattr(self, 'scan_dialog', None) or not self.scan_dialog.parent:
+            return
+        if getattr(self, 'is_scanner_paused', False):
+            return
+
+        clean_code = re.sub(r'[\r\n\t\x00-\x1f\x7f]', '', str(raw_code or '')).strip()
+        if not clean_code:
+            return
+
+        check = self._evaluate_retail_code(clean_code, format_str)
+        if not check['valid']:
+            return
+
+        now = time.time()
+        if clean_code == getattr(self, 'potential_code', None) and (now - getattr(self, '_consensus_ts', 0.0)) <= 0.95:
+            self.consecutive_frames = getattr(self, 'consecutive_frames', 0) + 1
+        else:
+            self.potential_code = clean_code
+            self.consecutive_frames = 1
+        self._consensus_ts = now
+
+        required_hits = 3
+        if check['is_qr']:
+            required_hits = 2
+        elif check['is_weak_1d'] or (not check['checksum_ok'] and len(clean_code) <= 5):
+            required_hits = 4
+        if self.consecutive_frames < required_hits:
+            return
+
+        cooldown = 1.5
+        recent_map = getattr(self, '_recent_scan_times', {})
+        last_code_ts = recent_map.get(clean_code, 0.0)
+        if (clean_code == getattr(self, '_last_scanned_code', '') and (now - getattr(self, 'last_scan_time', 0.0)) < cooldown) or (now - last_code_ts) < cooldown:
+            return
+        if (now - getattr(self, '_last_any_scan_time', 0.0)) < 0.4:
+            return
+
+        self._last_scanned_code = clean_code
+        self.last_scan_time = now
+        self._last_any_scan_time = now
+        recent_map[clean_code] = now
+        if len(recent_map) > 100:
+            for k in [k for k, v in recent_map.items() if (now - v) > 10.0]:
+                del recent_map[k]
+        self._recent_scan_times = recent_map
+        self.potential_code = None
+        self.consecutive_frames = 0
+
+        self.process_continuous_scan(clean_code)
+
+    def _handle_manual_scan_submit(self):
+        if not getattr(self, 'scan_manual_field', None):
+            return
+        code = re.sub(r'[\r\n\t\x00-\x1f\x7f]', '', str(self.scan_manual_field.text or '')).strip()
+        if not code:
+            return
+        self.scan_manual_field.text = ''
+        self.scan_manual_field.focus = False
+        self.process_continuous_scan(code)
 
     def process_continuous_scan(self, code: str):
         if not getattr(self, 'scan_dialog', None) or not self.scan_dialog.parent:
             return
+        sound_on = getattr(self, 'scanner_sound_enabled', True)
         if getattr(self, 'target_scan_field', None) is not None:
             self.target_scan_field.text = code
-            self.play_sound('success')
+            self._flash_scan_frame(True)
+            if sound_on:
+                self.play_sound('success')
             self.close_barcode_scanner()
             return
         prod = self.db.get_product_by_barcode(code)
         if not prod:
-            self.play_sound('error')
+            self._flash_scan_frame(False)
+            if sound_on:
+                self.play_sound('error')
             self.notify(f'Code-barres introuvable : {code}', 'error')
             return
         if any(it['id'] == prod['id'] for it in self.temp_scanned_cart):
-            self.play_sound('duplicate')
+            self._flash_scan_frame(False)
+            if sound_on:
+                self.play_sound('duplicate')
             self.notify(f"Déjà scanné : {self.fix_text(prod['name'])}", 'warning')
             return
         ok_stk, msg_stk = self._check_stock_availability(prod, Decimal('1'))
         if not ok_stk:
-            self.play_sound('error')
+            self._flash_scan_frame(False)
+            if sound_on:
+                self.play_sound('error')
             self.notify(msg_stk.replace('\n', ' '), 'error')
             return
         self.temp_scanned_cart.append(prod)
         self._refresh_scan_list_ui()
-        self.play_sound('success')
+        self._flash_scan_frame(True)
+        if sound_on:
+            self.play_sound('success')
 
     def _refresh_scan_list_ui(self):
         self.scan_list_widget.clear_widgets()
