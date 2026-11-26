@@ -7619,16 +7619,21 @@ class StockApp(MDApp):
             if params is None:
                 return
 
+            params_changed = False
             try:
                 f_modes = params.getSupportedFocusModes()
                 if f_modes is not None:
                     modes_list = [str(m) for m in f_modes.toArray()]
-                    if 'continuous-picture' in modes_list:
+                    cur_focus = str(params.getFocusMode() or '')
+                    if 'continuous-picture' in modes_list and cur_focus != 'continuous-picture':
                         params.setFocusMode('continuous-picture')
-                    elif 'continuous-video' in modes_list:
+                        params_changed = True
+                    elif 'continuous-video' in modes_list and cur_focus not in ('continuous-picture', 'continuous-video'):
                         params.setFocusMode('continuous-video')
-                    elif 'auto' in modes_list:
+                        params_changed = True
+                    elif 'auto' in modes_list and not cur_focus:
                         params.setFocusMode('auto')
+                        params_changed = True
             except Exception:
                 pass
 
@@ -7641,16 +7646,7 @@ class StockApp(MDApp):
                         self._zoom_ratios = []
                     if not self._zoom_initialized:
                         self._zoom_initialized = True
-                        default_idx = 0
-                        for idx, r_val in enumerate(self._zoom_ratios):
-                            if r_val >= 100:
-                                default_idx = idx
-                                break
-                        try:
-                            params.setZoom(default_idx)
-                            self._current_zoom = (self._zoom_ratios[default_idx] / 100.0) if self._zoom_ratios else 1.0
-                        except Exception:
-                            self._current_zoom = 1.0
+                        self._current_zoom = 1.0
                     if getattr(self, 'btn_scan_zoom', None):
                         if self._zoom_ratios and max(self._zoom_ratios) >= 150:
                             self.btn_scan_zoom.opacity = 1
@@ -7676,7 +7672,8 @@ class StockApp(MDApp):
             except Exception:
                 pass
 
-            acam.setParameters(params)
+            if params_changed:
+                acam.setParameters(params)
         except Exception:
             pass
 
@@ -7814,32 +7811,68 @@ class StockApp(MDApp):
                 self._laser_color.a = 0.95
             Clock.schedule_once(lambda dt: self._optimize_camera_params(), 0.4)
 
+    def _update_camera_preview_layout(self, *args):
+        preview_clip = getattr(self, 'preview_clip_ref', None)
+        cam_wgt = getattr(self, 'camera_widget', None)
+        if not preview_clip or not cam_wgt:
+            return
+        area_w, area_h = preview_clip.size
+        if area_w <= 1 or area_h <= 1:
+            return
+        tex = getattr(cam_wgt, 'texture', None)
+        if tex and tex.size[0] > 0 and tex.size[1] > 0:
+            cam_w, cam_h = float(tex.size[0]), float(tex.size[1])
+        else:
+            res = getattr(cam_wgt, 'resolution', (640, 480))
+            cam_w, cam_h = float(res[0]), float(res[1])
+
+        is_android = platform == 'android'
+        upright_ratio = (cam_h / cam_w) if is_android else (cam_w / cam_h)
+        area_ratio = area_w / area_h
+        if area_ratio > upright_ratio:
+            disp_w = area_w
+            disp_h = area_w / upright_ratio
+        else:
+            disp_h = area_h
+            disp_w = area_h * upright_ratio
+
+        cam_wgt.size_hint = (None, None)
+        cam_wgt.size = (disp_h, disp_w) if is_android else (disp_w, disp_h)
+        cam_wgt.center = preview_clip.center
+        if getattr(self, 'rotation', None):
+            self.rotation.origin = cam_wgt.center
+
     def _launch_camera_widget(self):
         from kivy.graphics import Color, Line, Rectangle
+        from kivy.uix.stencilview import StencilView
         self.scanner_start_time = time.time()
         self._laser_phase = 0.0
         self._laser_dir = 1.0
         try:
-            try:
-                self.camera_widget = Camera(play=True, index=0, resolution=(1280, 720), allow_stretch=True, keep_ratio=False)
-            except Exception:
-                self.camera_widget = Camera(play=True, index=0, resolution=(640, 480), allow_stretch=True, keep_ratio=False)
+            self.camera_widget = Camera(play=True, index=0, resolution=(640, 480), allow_stretch=True, keep_ratio=False)
             with self.camera_widget.canvas.before:
                 PushMatrix()
                 self.rotation = Rotate(angle=-90 if platform == 'android' else 0, origin=self.camera_widget.center)
             with self.camera_widget.canvas.after:
                 PopMatrix()
-            self.camera_widget.bind(center=lambda i, v: setattr(self.rotation, 'origin', i.center))
+            self.camera_widget.bind(
+                center=lambda i, v: setattr(self.rotation, 'origin', i.center) if getattr(self, 'rotation', None) else None,
+                texture=self._update_camera_preview_layout,
+            )
         except Exception:
             self.notify('Erreur chargement caméra.', 'error')
             return
 
         is_single = getattr(self, 'target_scan_field', None) is not None
         root = MDBoxLayout(orientation='vertical')
-        cam_area = MDFloatLayout(size_hint_y=0.90 if is_single else 0.48)
+        cam_area = MDFloatLayout(size_hint_y=1.0 if is_single else 0.48)
         self.cam_area_ref = cam_area
-        self.camera_widget.size_hint = (1, 1)
-        cam_area.add_widget(self.camera_widget)
+
+        preview_clip = StencilView(size_hint=(1, 1), pos_hint={'x': 0, 'y': 0})
+        self.preview_clip_ref = preview_clip
+        preview_clip.add_widget(self.camera_widget)
+        preview_clip.bind(pos=self._update_camera_preview_layout, size=self._update_camera_preview_layout)
+        cam_area.add_widget(preview_clip)
 
         with cam_area.canvas.after:
             self._scan_box_color = Color(0.20, 0.83, 0.60, 0.92)
@@ -7926,9 +7959,9 @@ class StockApp(MDApp):
         self.scan_dialog = ModalView(size_hint=(1, 1), auto_dismiss=False, background_color=(0, 0, 0, 1))
         self.scan_dialog.add_widget(root)
         self.scan_dialog.open()
-        Clock.schedule_once(lambda dt: self._update_scan_overlay_geometry(), 0.05)
-        Clock.schedule_once(lambda dt: self._optimize_camera_params(), 0.35)
-        Clock.schedule_once(lambda dt: self._optimize_camera_params(), 0.90)
+        Clock.schedule_once(lambda dt: [self._update_camera_preview_layout(), self._update_scan_overlay_geometry()], 0.05)
+        Clock.schedule_once(lambda dt: [self._update_camera_preview_layout(), self._optimize_camera_params()], 0.45)
+        Clock.schedule_once(lambda dt: [self._update_camera_preview_layout(), self._optimize_camera_params()], 1.00)
         self._laser_ev = Clock.schedule_interval(self._animate_laser_step, 1.0 / 30.0)
         self.scan_event = Clock.schedule_interval(self.detect_barcode_frame, 1.0 / 20.0)
 
@@ -7939,7 +7972,7 @@ class StockApp(MDApp):
         x, y = cam_area.pos
         w, h = cam_area.size
         box_w = max(dp(40), w * 0.84)
-        box_h = max(dp(40), h * 0.56)
+        box_h = min(max(dp(40), h * 0.58), dp(260))
         box_x = x + (w - box_w) / 2.0
         box_y = y + (h - box_h) / 2.0
         self._scan_box_rect = (box_x, box_y, box_w, box_h)
@@ -7999,11 +8032,30 @@ class StockApp(MDApp):
                     pass
             self._torch_active = False
         if getattr(self, 'camera_widget', None):
-            self.camera_widget.play = False
+            try:
+                self.camera_widget.play = False
+                cam_core = getattr(self.camera_widget, '_camera', None)
+                if cam_core is not None:
+                    if hasattr(cam_core, 'stop'):
+                        cam_core.stop()
+                    acam = getattr(cam_core, '_android_camera', None) or getattr(cam_core, '_camera', None)
+                    if acam is not None:
+                        try:
+                            acam.release()
+                        except Exception:
+                            pass
+                        if hasattr(cam_core, '_android_camera'):
+                            cam_core._android_camera = None
+                        if hasattr(cam_core, '_camera'):
+                            cam_core._camera = None
+            except Exception:
+                pass
+            self.camera_widget = None
         if getattr(self, 'scan_dialog', None):
             self.scan_dialog.dismiss()
             self.scan_dialog = None
         self.cam_area_ref = None
+        self.preview_clip_ref = None
         self._scan_box_color = None
         self._scan_box_line = None
         self._laser_color = None
