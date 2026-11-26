@@ -854,6 +854,68 @@ class DatabaseManager:
                     value TEXT
                 )
             ''')
+
+            expected_columns = {
+                'products': (
+                    ("barcode", "TEXT DEFAULT ''"),
+                    ("product_ref", "TEXT DEFAULT ''"),
+                    ("reference", "TEXT DEFAULT ''"),
+                    ("family", "TEXT DEFAULT ''"),
+                    ("purchase_price", "REAL DEFAULT 0"),
+                    ("price", "REAL DEFAULT 0"),
+                    ("price_semi", "REAL DEFAULT 0"),
+                    ("price_wholesale", "REAL DEFAULT 0"),
+                    ("tva", "REAL DEFAULT 0"),
+                    ("stock_store", "REAL DEFAULT 0"),
+                    ("stock_warehouse", "REAL DEFAULT 0"),
+                    ("image_path", "TEXT DEFAULT ''"),
+                    ("is_promo_active", "INTEGER DEFAULT 0"),
+                    ("promo_type", "TEXT DEFAULT 'fixed'"),
+                    ("promo_value", "REAL DEFAULT 0"),
+                    ("promo_expiry", "TEXT DEFAULT ''"),
+                ),
+                'entities': (
+                    ("phone", "TEXT DEFAULT ''"),
+                    ("balance", "REAL DEFAULT 0"),
+                    ("address", "TEXT DEFAULT ''"),
+                    ("email", "TEXT DEFAULT ''"),
+                    ("activity", "TEXT DEFAULT ''"),
+                    ("rc", "TEXT DEFAULT ''"),
+                    ("nif", "TEXT DEFAULT ''"),
+                    ("nis", "TEXT DEFAULT ''"),
+                    ("nai", "TEXT DEFAULT ''"),
+                    ("price_category", "TEXT DEFAULT 'Détail'"),
+                    ("gps_location", "TEXT DEFAULT ''"),
+                ),
+                'transactions': (
+                    ("doc_number", "TEXT DEFAULT ''"),
+                    ("total_amount", "REAL DEFAULT 0"),
+                    ("global_discount", "REAL DEFAULT 0"),
+                    ("paid_amount", "REAL DEFAULT 0"),
+                    ("payment_method", "TEXT DEFAULT ''"),
+                    ("stamp_duty", "REAL DEFAULT 0"),
+                    ("location", "TEXT DEFAULT 'store'"),
+                    ("note", "TEXT DEFAULT ''"),
+                    ("user_name", "TEXT DEFAULT 'ADMIN'"),
+                ),
+                'transaction_items': (
+                    ("cost_at_time", "REAL DEFAULT 0"),
+                    ("tva", "REAL DEFAULT 0"),
+                    ("discount_amount", "REAL DEFAULT 0"),
+                    ("discount_type", "TEXT DEFAULT 'fixed'"),
+                ),
+                'general_expenses': (
+                    ("description", "TEXT DEFAULT ''"),
+                    ("category", "TEXT DEFAULT 'Autre'"),
+                    ("recorded_by", "TEXT DEFAULT 'ADMIN'"),
+                ),
+            }
+            for tbl_name, cols_spec in expected_columns.items():
+                existing = {r[1] for r in cur.execute(f'PRAGMA table_info({tbl_name})').fetchall()}
+                for col_name, col_def in cols_spec:
+                    if col_name not in existing:
+                        cur.execute(f'ALTER TABLE {tbl_name} ADD COLUMN {col_name} {col_def}')
+
             for idx_sql in (
                 'CREATE INDEX IF NOT EXISTS idx_prod_name ON products(name)',
                 'CREATE INDEX IF NOT EXISTS idx_prod_barcode ON products(barcode)',
@@ -900,7 +962,7 @@ class DatabaseManager:
                 ),
             )
             defaults = {
-                'allow_negative_stock': 'False',
+                'allow_negative_stock': 'True',
                 'warn_price_below_cost': 'True',
                 'printer_auto': 'False',
                 'show_balance_in_pdf': 'False',
@@ -1569,6 +1631,7 @@ class DatabaseManager:
         running_store = Decimal('0')
         running_wh = Decimal('0')
         has_purchases = False
+        sale_cost_updates = []
 
         for ev in timeline:
             qty = ev['qty']
@@ -1582,12 +1645,16 @@ class DatabaseManager:
                         new_total_qty = qty_for_avg + qty
                         if new_total_qty > 0:
                             running_pmp = (qty_for_avg * running_pmp + qty * ev['price']) / new_total_qty
+                    elif dt_code == AppConstants.DOC_RC:
+                        sale_cost_updates.append((ev['id'], running_pmp if has_purchases else orig_cost))
                     running_global += qty
                     if ev['loc'] == AppConstants.LOC_WAREHOUSE:
                         running_wh += qty
                     else:
                         running_store += qty
                 elif direction == -1:
+                    if dt_code in (AppConstants.DOC_BV, AppConstants.DOC_FC):
+                        sale_cost_updates.append((ev['id'], running_pmp if has_purchases else orig_cost))
                     running_global -= qty
                     if ev['loc'] == AppConstants.LOC_WAREHOUSE:
                         running_wh -= qty
@@ -1619,18 +1686,19 @@ class DatabaseManager:
             'UPDATE products SET stock_store = ?, stock_warehouse = ?, purchase_price = ? WHERE id = ?',
             (float(final_store), float(final_wh), float(final_pmp), product_id),
         )
-        if final_pmp > Decimal('0'):
+        for tx_id_item, cost_at_ev in sale_cost_updates:
+            eff_cost = FinancialEngine.quantize_money(cost_at_ev)
+            if eff_cost <= Decimal('0') and final_pmp > Decimal('0'):
+                eff_cost = final_pmp
+            if abs(eff_cost) >= AppConstants.MAX_AMOUNT_LIMIT:
+                eff_cost = Decimal('0.00')
             cursor.execute(
                 '''
                 UPDATE transaction_items
                 SET cost_at_time = ?
-                WHERE product_id = ?
-                  AND (cost_at_time IS NULL OR cost_at_time = 0)
-                  AND transaction_id IN (
-                      SELECT id FROM transactions WHERE doc_type IN (?, ?, ?)
-                  )
+                WHERE transaction_id = ? AND product_id = ?
                 ''',
-                (float(final_pmp), product_id, AppConstants.DOC_BV, AppConstants.DOC_FC, AppConstants.DOC_RC),
+                (float(eff_cost), tx_id_item, product_id),
             )
 
     def _reverse_invoice_effects(self, cur: sqlite3.Cursor, tx_id: int) -> set:
@@ -1714,7 +1782,7 @@ class DatabaseManager:
             cur.execute('BEGIN')
 
             s_factor = AppConstants.STOCK_MOVEMENTS.get(doc_type, 0)
-            allow_negative = self.get_bool_setting('allow_negative_stock', default=False)
+            allow_negative = self.get_bool_setting('allow_negative_stock', default=True)
             if not is_simple and s_factor == -1 and not allow_negative:
                 old_loc_qtys = {}
                 if tx_id:
@@ -2030,9 +2098,11 @@ class DatabaseManager:
         limit: int = 50,
         offset: int = 0,
     ) -> list:
+        is_seller_only = doc_type_filter == 'SELLER_ONLY'
         include_tx = doc_type_filter != AppConstants.DOC_TR
         include_tr = (
-            entity_id is None
+            not is_seller_only
+            and entity_id is None
             and not entity_category
             and doc_type_filter in (AppConstants.FAM_ALL, AppConstants.DOC_TR)
         )
@@ -2064,7 +2134,10 @@ class DatabaseManager:
                 if entity_category:
                     tx_sql += ' AND t.entity_category = ?'
                     params.append(entity_category)
-                if doc_type_filter != AppConstants.FAM_ALL:
+                if is_seller_only:
+                    tx_sql += ' AND t.doc_type IN (?, ?, ?)'
+                    params.extend([AppConstants.DOC_BV, AppConstants.DOC_RC, AppConstants.DOC_CLIENT_PAY])
+                elif doc_type_filter != AppConstants.FAM_ALL:
                     tx_sql += ' AND t.doc_type = ?'
                     params.append(doc_type_filter)
                 branches.append(tx_sql)
@@ -2263,6 +2336,7 @@ class DatabaseManager:
                         real_ht = Decimal('0.00')
                         all_ht = Decimal('0.00')
                         cogs = Decimal('0.00')
+                        has_real_items = False
                         for it in items_rows:
                             q = FinancialEngine.to_decimal(it['qty'])
                             p = FinancialEngine.to_decimal(it['price'])
@@ -2271,12 +2345,15 @@ class DatabaseManager:
                             line_ht = FinancialEngine.quantize_money((p - u_disc) * q)
                             all_ht += line_ht
                             if not AppConstants.is_default_product(it['product_id']):
+                                has_real_items = True
                                 real_ht += line_ht
                                 cogs += FinancialEngine.quantize_money(q * FinancialEngine.to_decimal(it['cost_at_time']))
-                        if real_ht > Decimal('0'):
+                        if has_real_items:
                             gd_ht = calc['total_ht_net_of_lines'] - calc['total_ht_final']
                             if all_ht > Decimal('0') and real_ht < all_ht:
                                 gd_ht = FinancialEngine.quantize_money(gd_ht * (real_ht / all_ht))
+                            elif real_ht == Decimal('0'):
+                                gd_ht = Decimal('0.00')
                             stats['gross_profit'] += (real_ht - gd_ht - cogs) * sign
 
             stats['profit'] = stats['gross_profit'] - stats['expenses']
@@ -2319,6 +2396,14 @@ class PDF(FPDF):
         if self.page_no() != 1:
             return
         store_name = self.smart_text(self.store_info.get('store_name', AppConstants.APP_NAME))
+        doc_type = self.doc_info.get('doc_type')
+        if doc_type in (AppConstants.DOC_CLIENT_PAY, AppConstants.DOC_SUPPLIER_PAY):
+            self.set_y(10)
+            self.set_font('arabic', 'B', 20)
+            self.cell(0, 10, store_name, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+            self.ln(4)
+            return
+
         info_lines = []
         if (act := self.smart_text(self.store_info.get('store_activity'))):
             info_lines.append(act)
@@ -2336,7 +2421,6 @@ class PDF(FPDF):
         if pe:
             info_lines.append(pe)
 
-        doc_type = self.doc_info.get('doc_type')
         if doc_type not in (AppConstants.DOC_BV, AppConstants.DOC_BA):
             rn = ' / '.join(
                 filter(
@@ -2360,6 +2444,8 @@ class PDF(FPDF):
             )
             if nn:
                 info_lines.append(nn)
+            if (rib := self.smart_text(self.store_info.get('store_rib'))):
+                info_lines.append(f'RIB : {rib}')
 
         self.set_y(8)
         block_w = 120
@@ -2577,6 +2663,101 @@ class PDF(FPDF):
         self._draw_final_page_footer_content()
 
 
+    def draw_financial_receipt(self, op_label: str, op_datetime: str, note_txt: str, amount_val, recipient_sig: str = ''):
+        x0 = self.l_margin
+        w_box = self.w - self.l_margin - self.r_margin
+        y0 = self.get_y() + 4
+
+        self.set_draw_color(90, 110, 140)
+        self.set_line_width(0.35)
+
+        hdr_h = 14
+        self.set_fill_color(235, 240, 247)
+        self.rect(x0, y0, w_box, hdr_h, style='DF')
+
+        doc_num = self.doc_info.get('doc_number', '')
+        self.set_font('arabic', 'B', 11)
+        self.set_xy(x0 + 4, y0 + 3)
+        self.cell(105, 8, self.smart_text(f'{op_label.upper()}   N° : {doc_num}'), border=0, align='L')
+
+        amt_w, amt_h = 70, 9
+        amt_x = x0 + w_box - amt_w - 4
+        amt_y = y0 + 2.5
+        self.set_fill_color(255, 255, 255)
+        self.rect(amt_x, amt_y, amt_w, amt_h, style='DF')
+        self.set_font('arabic', 'B', 11)
+        self.set_xy(amt_x, amt_y)
+        self.cell(amt_w, amt_h, f'# {FinancialEngine.format_money(amount_val)} #', border=0, align='C')
+
+        self.set_draw_color(195, 205, 220)
+        self.set_line_width(0.25)
+        cur_y = y0 + hdr_h + 6
+
+        dt_code = self.doc_info.get('doc_type', '')
+        ent_name = self.entity_info.get('name', '')
+        if dt_code == AppConstants.DOC_SUPPLIER_PAY:
+            lbl_party, lbl_w = "Payé à l'ordre de :", 34
+        else:
+            lbl_party, lbl_w = 'Reçu de :', 19
+        self.set_font('arabic', '', 10)
+        self.set_xy(x0 + 5, cur_y)
+        self.cell(lbl_w, 6, lbl_party, border=0, align='L')
+        self.set_font('arabic', 'B', 10.5)
+        self.cell(w_box - lbl_w - 10, 6, self.smart_text(ent_name), border=0, align='L')
+        cur_y += 7
+        self.line(x0 + 5, cur_y, x0 + w_box - 5, cur_y)
+        cur_y += 5
+
+        self.set_font('arabic', '', 10)
+        self.set_xy(x0 + 5, cur_y)
+        self.cell(26, 6, 'La somme de :', border=0, align='L')
+        self.set_font('arabic', 'B', 10)
+        self.set_xy(x0 + 31, cur_y)
+        self.multi_cell(w_box - 36, 6, self.smart_text(self.amount_in_words), border=0, align='L')
+        cur_y = max(cur_y + 7, self.get_y() + 1)
+        self.line(x0 + 5, cur_y, x0 + w_box - 5, cur_y)
+        cur_y += 5
+
+        clean_note = str(note_txt or '').strip() or op_label
+        self.set_font('arabic', '', 10)
+        self.set_xy(x0 + 5, cur_y)
+        self.cell(14, 6, 'Motif :', border=0, align='L')
+        self.set_xy(x0 + 19, cur_y)
+        self.multi_cell(w_box - 24, 6, self.smart_text(clean_note), border=0, align='L')
+        cur_y = max(cur_y + 7, self.get_y() + 1)
+        self.line(x0 + 5, cur_y, x0 + w_box - 5, cur_y)
+        cur_y += 5
+
+        lieu = self.smart_text(self.store_info.get('store_address', '') or self.store_info.get('store_name', ''))
+        meta_left = f'Fait à : {lieu}' if lieu else ''
+        self.set_font('arabic', '', 9.5)
+        self.set_xy(x0 + 5, cur_y)
+        self.cell(105, 6, meta_left, border=0, align='L')
+        self.set_font('arabic', 'B', 9.5)
+        self.cell(w_box - 115, 6, f'Le : {op_datetime}', border=0, align='R')
+        cur_y += 10
+
+        if self.balance_data:
+            strip_h = 10
+            self.set_draw_color(170, 185, 205)
+            self.set_fill_color(246, 248, 251)
+            self.rect(x0, cur_y, w_box, strip_h, style='DF')
+            col3 = w_box / 3.0
+            self.set_font('arabic', '', 8.5)
+            self.set_xy(x0 + 3, cur_y + 1.5)
+            self.cell(col3 - 4, 7, f"Ancien Solde : {FinancialEngine.format_money(self.balance_data['old_balance'])}", border=0, align='L')
+            self.cell(col3, 7, f"Opération : {FinancialEngine.format_money(self.balance_data['transaction_amount'])}", border=0, align='C')
+            self.set_font('arabic', 'B', 8.5)
+            self.cell(col3 - 2, 7, f"Nouveau Solde : {FinancialEngine.format_money(self.balance_data['new_balance'])}", border=0, align='R')
+            cur_y += strip_h
+
+        self.set_draw_color(60, 80, 110)
+        self.set_line_width(0.55)
+        self.rect(x0, y0, w_box, cur_y - y0)
+
+        self.set_draw_color(0, 0, 0)
+        self.set_line_width(0.2)
+
 # ==============================================================================
 # 6. LANGAGE KV & WIDGETS PERSONNALISÉS (SAISIE ARABE / RECYCLEVIEW FLUIDE)
 # ==============================================================================
@@ -2595,71 +2776,79 @@ KV_BUILDER = '''
 <ProductRecycleItem>:
     orientation: 'vertical'
     size_hint_y: None
-    height: dp(90)
+    height: dp(94)
     padding: 0
     spacing: 0
 
     MDCard:
         orientation: 'horizontal'
-        padding: dp(10)
-        spacing: dp(10)
-        radius: [8]
-        elevation: 1
+        padding: [dp(12), dp(10)]
+        spacing: dp(12)
+        radius: [14]
+        elevation: 0
+        line_color: (0.89, 0.91, 0.94, 1)
+        line_width: 1
         ripple_behavior: True
         on_release: root.on_tap()
         md_bg_color: (1, 1, 1, 1)
 
         MDCard:
             size_hint: None, None
-            size: dp(55), dp(55)
-            radius: [8]
+            size: dp(54), dp(54)
+            radius: [12]
             elevation: 0
-            padding: 0
+            md_bg_color: root.thumb_bg
+            line_color: (0.88, 0.91, 0.95, 1)
+            line_width: 1
             pos_hint: {'center_y': .5}
-            md_bg_color: (0.95, 0.95, 0.95, 1)
             ripple_behavior: True
             on_release: root.on_zoom()
 
             MDFloatLayout:
-                size_hint: 1, 1
                 MDIcon:
                     icon: root.icon_name
                     theme_text_color: "Custom"
                     text_color: root.icon_color
+                    size_hint: None, None
+                    size: dp(32), dp(32)
+                    halign: "center"
+                    valign: "middle"
                     pos_hint: {'center_x': .5, 'center_y': .5}
-                    font_size: '30sp'
+                    font_size: '28sp'
                     opacity: 0 if root.image_path else 1
 
                 FitImage:
                     source: root.image_path if root.image_path else ''
-                    radius: [8]
+                    radius: [11]
                     mipmap: True
                     opacity: 1 if root.image_path else 0
-                    size_hint: 1, 1
                     pos_hint: {'center_x': .5, 'center_y': .5}
-                    fit_mode: "cover"
 
         MDBoxLayout:
             orientation: 'vertical'
-            pos_hint: {'center_y': .5}
-            spacing: dp(5)
+            size_hint_y: 1
+            spacing: dp(4)
 
             MDLabel:
                 text: root.text_name
                 font_style: "Subtitle1"
                 bold: True
-                text_size: self.width, None
-                max_lines: 2
+                size_hint_y: 1
+                text_size: self.size
+                valign: 'center'
                 halign: 'left'
-                valign: 'top'
-                font_size: '16sp'
+                max_lines: 2
+                shorten: False
+                font_size: '15sp'
                 theme_text_color: "Custom"
-                text_color: (0.1, 0.1, 0.1, 1)
+                text_color: (0.1, 0.12, 0.16, 1)
                 font_name: 'ArabicFont'
 
             MDBoxLayout:
                 orientation: 'horizontal'
-                spacing: dp(5)
+                size_hint_y: None
+                height: dp(28)
+                spacing: dp(8)
 
                 MDLabel:
                     text: root.text_price
@@ -2667,43 +2856,61 @@ KV_BUILDER = '''
                     theme_text_color: "Custom"
                     text_color: root.price_color
                     bold: True
-                    size_hint_x: None
-                    adaptive_width: True
-                    font_size: '19sp'
-                    font_name: 'ArabicFont'
+                    size_hint_x: 0.54
+                    size_hint_y: 1
+                    text_size: self.size
+                    valign: 'center'
+                    halign: 'left'
                     max_lines: 1
+                    font_size: '17sp'
+                    font_name: 'ArabicFont'
 
-                MDLabel:
-                    text: root.text_stock
-                    theme_text_color: "Custom"
-                    text_color: (0.1, 0.1, 0.1, 1)
-                    halign: 'right'
-                    size_hint_x: 1
-                    bold: True
-                    font_size: '13sp'
-                    max_lines: 1
-                    shorten: True
-                    font_name: 'ArabicFont'
+                MDCard:
+                    size_hint_x: 0.46
+                    size_hint_y: None
+                    height: dp(26)
+                    radius: [8]
+                    elevation: 0
+                    md_bg_color: root.stock_bg
+                    padding: [dp(6), 0]
+                    pos_hint: {'center_y': .5}
+
+                    MDLabel:
+                        text: root.text_stock
+                        theme_text_color: "Custom"
+                        text_color: root.stock_color
+                        size_hint_y: 1
+                        text_size: self.size
+                        halign: 'center'
+                        valign: 'center'
+                        bold: True
+                        max_lines: 1
+                        shorten: True
+                        shorten_from: 'right'
+                        font_size: '11.5sp'
+                        font_name: 'ArabicFont'
 
 <ProductRecycleView>:
     viewclass: 'ProductRecycleItem'
     RecycleBoxLayout:
-        default_size: None, dp(95)
+        default_size: None, dp(94)
         default_size_hint: 1, None
         size_hint_y: None
         height: self.minimum_height
         orientation: 'vertical'
-        spacing: dp(4)
-        padding: dp(5)
+        spacing: dp(8)
+        padding: [dp(12), dp(10), dp(12), dp(12)]
 
 <HistoryRecycleItem>:
     orientation: "vertical"
     size_hint_y: None
-    height: dp(130)
-    padding: dp(12)
+    height: dp(116)
+    padding: [dp(12), dp(10)]
     spacing: dp(6)
     radius: [14]
-    elevation: 2
+    elevation: 0
+    line_color: (0.87, 0.89, 0.93, 1)
+    line_width: 1
     ripple_behavior: True
     md_bg_color: root.bg_color
     on_release: root.on_tap()
@@ -2711,72 +2918,88 @@ KV_BUILDER = '''
     MDBoxLayout:
         orientation: "horizontal"
         size_hint_y: None
-        height: dp(38)
+        height: dp(36)
         spacing: dp(10)
 
-        MDCard:
+        MDFloatLayout:
             size_hint: None, None
-            size: dp(38), dp(38)
-            radius: [19]
-            md_bg_color: (0.95, 0.95, 0.95, 1)
-            elevation: 0
+            size: dp(36), dp(36)
             pos_hint: {"center_y": .5}
+            canvas.before:
+                Color:
+                    rgba: (1, 1, 1, 0.92)
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(18)]
 
             MDIcon:
                 icon: root.icon_name
                 theme_text_color: "Custom"
                 text_color: root.icon_color
+                size_hint: None, None
+                size: dp(22), dp(22)
+                halign: "center"
+                valign: "middle"
                 pos_hint: {"center_x": .5, "center_y": .5}
-                font_size: "22sp"
+                font_size: "20sp"
 
         MDBoxLayout:
             orientation: "vertical"
-            spacing: dp(2)
+            spacing: dp(1)
             pos_hint: {"center_y": .5}
 
             MDLabel:
                 text: root.text_type
                 bold: True
                 font_style: "Subtitle1"
+                font_size: "15sp"
                 theme_text_color: "Primary"
                 font_name: 'ArabicFont'
                 halign: "left"
+                size_hint_y: None
+                height: dp(20)
 
             MDLabel:
                 text: root.text_ref
                 font_style: "Caption"
+                font_size: "11.5sp"
                 theme_text_color: "Secondary"
                 font_name: 'ArabicFont'
                 halign: "left"
+                size_hint_y: None
+                height: dp(15) if root.text_ref else 0
+                opacity: 1 if root.text_ref else 0
 
     MDLabel:
         text: root.text_entity
         font_style: "Subtitle1"
-        font_size: "16sp"
+        font_size: "15sp"
         bold: True
         theme_text_color: "Custom"
-        text_color: (0.1, 0.1, 0.1, 1)
+        text_color: (0.1, 0.12, 0.16, 1)
         font_name: 'ArabicFont'
-        size_hint_y: None
-        height: self.texture_size[1]
-        text_size: self.width, None
-        max_lines: 2
-        halign: "left"
-
-    MDBoxLayout:
         size_hint_y: 1
+        text_size: self.size
+        valign: "center"
+        halign: "left"
+        max_lines: 2
+        shorten: False
 
     MDBoxLayout:
         orientation: "horizontal"
         size_hint_y: None
-        height: dp(24)
+        height: dp(22) if (root.text_date or root.text_amount) else 0
+        opacity: 1 if (root.text_date or root.text_amount) else 0
 
         MDLabel:
             text: root.text_date
             font_style: "Caption"
+            font_size: "11.5sp"
             theme_text_color: "Hint"
             halign: "left"
-            size_hint_x: 0.4
+            valign: "center"
+            size_hint_x: 0.45
             font_name: 'ArabicFont'
 
         MDLabel:
@@ -2786,100 +3009,143 @@ KV_BUILDER = '''
             theme_text_color: "Custom"
             text_color: root.icon_color
             halign: "right"
-            font_size: "17sp"
-            size_hint_x: 0.6
+            valign: "center"
+            font_size: "16sp"
+            size_hint_x: 0.55
             font_name: 'ArabicFont'
 
 <HistoryRecycleView>:
     viewclass: 'HistoryRecycleItem'
     RecycleBoxLayout:
-        default_size: None, dp(136)
+        default_size: None, dp(116)
+        default_size_hint: 1, None
+        size_hint_y: None
+        height: self.minimum_height
+        orientation: 'vertical'
+        spacing: dp(8)
+        padding: [dp(2), dp(4)]
+
+<EntityRecycleItem>:
+    orientation: "horizontal"
+    size_hint_y: None
+    height: dp(76)
+    padding: [dp(12), dp(8)]
+    spacing: dp(12)
+    ripple_behavior: True
+    md_bg_color: root.bg_color
+    line_color: (0.89, 0.91, 0.94, 1)
+    line_width: 1
+    radius: [12]
+    elevation: 0
+    on_release: root.on_tap()
+
+    MDFloatLayout:
+        size_hint: None, None
+        size: dp(44), dp(44)
+        pos_hint: {"center_y": .5}
+        canvas.before:
+            Color:
+                rgba: root.icon_bg
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [dp(22)]
+
+        MDIcon:
+            icon: root.icon_name
+            theme_text_color: "Custom"
+            text_color: root.icon_color
+            size_hint: None, None
+            size: dp(26), dp(26)
+            halign: "center"
+            valign: "middle"
+            pos_hint: {"center_x": .5, "center_y": .5}
+            font_size: "24sp"
+
+    MDBoxLayout:
+        orientation: "vertical"
+        pos_hint: {"center_y": .5}
+        size_hint_x: 1
+        spacing: dp(3)
+
+        MDLabel:
+            text: root.text_name
+            bold: True
+            font_style: "Subtitle1"
+            font_name: 'ArabicFont'
+            theme_text_color: "Custom"
+            text_color: (0.1, 0.12, 0.16, 1)
+            shorten: True
+            shorten_from: 'right'
+
+        MDLabel:
+            text: root.text_balance
+            font_style: "Caption"
+            font_name: 'ArabicFont'
+            markup: True
+            theme_text_color: "Secondary"
+
+    MDIcon:
+        icon: "chevron-right"
+        theme_text_color: "Hint"
+        font_size: "22sp"
+        size_hint_x: None
+        width: dp(22)
+        pos_hint: {"center_y": .5}
+
+<EntityRecycleView>:
+    viewclass: 'EntityRecycleItem'
+    RecycleBoxLayout:
+        default_size: None, dp(76)
         default_size_hint: 1, None
         size_hint_y: None
         height: self.minimum_height
         orientation: 'vertical'
         spacing: dp(6)
-        padding: dp(5)
-
-<EntityRecycleItem>:
-    orientation: "horizontal"
-    size_hint_y: None
-    height: dp(80)
-    padding: dp(10)
-    spacing: dp(15)
-    ripple_behavior: True
-    md_bg_color: (1, 1, 1, 1)
-    radius: [0]
-    on_release: root.on_tap()
-
-    MDIcon:
-        icon: root.icon_name
-        theme_text_color: "Custom"
-        text_color: root.icon_color
-        pos_hint: {"center_y": .5}
-        font_size: "32sp"
-        size_hint_x: None
-        width: dp(40)
-
-    MDBoxLayout:
-        orientation: "vertical"
-        pos_hint: {"center_y": .5}
-        size_hint_x: 1
-        spacing: dp(4)
-
-        MDLabel:
-            text: root.text_name
-            bold: True
-            font_style: "Subtitle1"
-            font_name: 'ArabicFont'
-            theme_text_color: "Custom"
-            text_color: (0.1, 0.1, 0.1, 1)
-            shorten: True
-            shorten_from: 'right'
-
-        MDLabel:
-            text: root.text_balance
-            font_style: "Caption"
-            font_name: 'ArabicFont'
-            markup: True
-            theme_text_color: "Secondary"
-
-<EntityRecycleView>:
-    viewclass: 'EntityRecycleItem'
-    RecycleBoxLayout:
-        default_size: None, dp(80)
-        default_size_hint: 1, None
-        size_hint_y: None
-        height: self.minimum_height
-        orientation: 'vertical'
-        spacing: dp(2)
-        padding: 0
+        padding: [dp(2), dp(4)]
 
 <MgmtEntityRecycleItem>:
     orientation: "horizontal"
     size_hint_y: None
-    height: dp(80)
-    padding: dp(10)
-    spacing: dp(5)
+    height: dp(78)
+    padding: [dp(12), dp(8)]
+    spacing: dp(10)
     ripple_behavior: True
     md_bg_color: root.bg_color
+    line_color: (0.89, 0.91, 0.94, 1)
+    line_width: 1
+    radius: [12]
+    elevation: 0
     on_release: root.on_pay()
 
-    MDIcon:
-        icon: "account-circle"
-        theme_text_color: "Custom"
-        text_color: (0.5, 0.5, 0.5, 1)
+    MDFloatLayout:
+        size_hint: None, None
+        size: dp(42), dp(42)
         pos_hint: {"center_y": .5}
-        font_size: "32sp"
-        size_hint_x: None
-        width: dp(40)
+        canvas.before:
+            Color:
+                rgba: (0.93, 0.95, 0.98, 1)
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [dp(21)]
+
+        MDIcon:
+            icon: "account-circle"
+            theme_text_color: "Custom"
+            text_color: (0.35, 0.42, 0.52, 1)
+            size_hint: None, None
+            size: dp(26), dp(26)
+            halign: "center"
+            valign: "middle"
+            pos_hint: {"center_x": .5, "center_y": .5}
+            font_size: "24sp"
 
     MDBoxLayout:
         orientation: "vertical"
         pos_hint: {"center_y": .5}
         size_hint_x: 1
-        spacing: dp(2)
-        padding: [dp(10), 0, 0, 0]
+        spacing: dp(3)
 
         MDLabel:
             text: root.text_name
@@ -2887,7 +3153,7 @@ KV_BUILDER = '''
             font_style: "Subtitle1"
             font_name: 'ArabicFont'
             theme_text_color: "Custom"
-            text_color: (0.1, 0.1, 0.1, 1)
+            text_color: (0.1, 0.12, 0.16, 1)
             shorten: True
             shorten_from: 'right'
             halign: "left"
@@ -2900,74 +3166,164 @@ KV_BUILDER = '''
             theme_text_color: "Secondary"
             halign: "left"
 
-    MDIconButton:
-        icon: "clock-time-eight-outline"
-        theme_text_color: "Custom"
-        text_color: (0, 0.5, 0.5, 1)
+    MDCard:
+        id: btn_hist
+        size_hint: None, None
+        size: dp(38), dp(38)
+        radius: [19]
+        elevation: 0
+        md_bg_color: (0.88, 0.96, 0.96, 1)
+        ripple_behavior: True
         pos_hint: {"center_y": .5}
         on_release: root.on_history()
+
+        MDFloatLayout:
+            MDIcon:
+                icon: "history"
+                theme_text_color: "Custom"
+                text_color: (0, 0.5, 0.55, 1)
+                size_hint: None, None
+                size: dp(22), dp(22)
+                halign: "center"
+                valign: "middle"
+                pos_hint: {"center_x": .5, "center_y": .5}
+                font_size: "21sp"
 
 <MgmtEntityRecycleView>:
     viewclass: 'MgmtEntityRecycleItem'
     RecycleBoxLayout:
-        default_size: None, dp(80)
+        default_size: None, dp(78)
         default_size_hint: 1, None
         size_hint_y: None
         height: self.minimum_height
         orientation: 'vertical'
-        spacing: dp(2)
-        padding: 0
+        spacing: dp(6)
+        padding: [dp(2), dp(4)]
 
 <CartRecycleItem>:
     orientation: "horizontal"
     size_hint_y: None
-    height: dp(85)
-    padding: [dp(15), 0, 0, 0]
+    height: dp(94)
+    padding: [dp(12), dp(10), dp(10), dp(10)]
+    spacing: dp(10)
     md_bg_color: 1, 1, 1, 1
-    radius: [0]
+    line_color: (0.89, 0.91, 0.94, 1)
+    line_width: 1
+    radius: [14]
+    elevation: 0
     ripple_behavior: True
     on_release: root.on_tap()
 
+    MDFloatLayout:
+        size_hint: None, None
+        size: dp(42), dp(42)
+        pos_hint: {"center_y": .5}
+        canvas.before:
+            Color:
+                rgba: (0.92, 0.95, 1, 1)
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [dp(12)]
+
+        MDIcon:
+            icon: root.badge_icon
+            theme_text_color: "Custom"
+            text_color: (0.1, 0.45, 0.85, 1)
+            size_hint: None, None
+            size: dp(24), dp(24)
+            halign: "center"
+            valign: "middle"
+            pos_hint: {"center_x": .5, "center_y": .5}
+            font_size: "22sp"
+
     MDBoxLayout:
         orientation: "vertical"
-        pos_hint: {"center_y": .5}
-        adaptive_height: True
+        size_hint_y: 1
         spacing: dp(4)
 
         MDLabel:
             text: root.text_name
             font_style: "Subtitle1"
+            font_size: "15sp"
             bold: True
-            theme_text_color: "Primary"
-            adaptive_height: True
-            font_name: 'ArabicFont'
-
-        MDLabel:
-            text: root.text_details
-            font_size: "16sp"
             theme_text_color: "Custom"
-            text_color: root.details_color
-            bold: True
-            adaptive_height: True
+            text_color: (0.1, 0.12, 0.16, 1)
+            size_hint_y: 1
+            text_size: self.size
+            valign: "center"
+            halign: "left"
+            max_lines: 2
+            shorten: False
             font_name: 'ArabicFont'
 
-    MDIconButton:
-        icon: "delete"
-        theme_text_color: "Custom"
-        text_color: (0.9, 0, 0, 1)
+        MDBoxLayout:
+            orientation: "horizontal"
+            size_hint_y: None
+            height: dp(24)
+            spacing: dp(6)
+
+            MDLabel:
+                text: root.text_details
+                font_size: "13sp"
+                theme_text_color: "Custom"
+                text_color: (0.42, 0.46, 0.52, 1) if root.text_subtotal else root.details_color
+                bold: False if root.text_subtotal else True
+                size_hint_x: 0.56 if root.text_subtotal else 1
+                size_hint_y: 1
+                text_size: self.size
+                valign: "center"
+                halign: "left"
+                max_lines: 1
+                shorten: True
+                shorten_from: "right"
+                font_name: 'ArabicFont'
+
+            MDLabel:
+                text: root.text_subtotal
+                font_size: "14sp"
+                theme_text_color: "Custom"
+                text_color: root.details_color
+                bold: True
+                size_hint_x: 0.44 if root.text_subtotal else 0
+                size_hint_y: 1
+                text_size: self.size
+                valign: "center"
+                halign: "right"
+                max_lines: 1
+                opacity: 1 if root.text_subtotal else 0
+                font_name: 'ArabicFont'
+
+    MDFloatLayout:
+        size_hint: None, None
+        size: dp(38), dp(38)
         pos_hint: {"center_y": .5}
-        icon_size: "24sp"
-        on_release: root.on_delete()
+        canvas.before:
+            Color:
+                rgba: (1, 0.93, 0.93, 1)
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [dp(10)]
+
+        MDIconButton:
+            icon: "trash-can-outline"
+            theme_text_color: "Custom"
+            text_color: (0.85, 0.14, 0.14, 1)
+            pos_hint: {"center_x": .5, "center_y": .5}
+            icon_size: "20sp"
+            on_release: root.on_delete()
 
 <CartRecycleView>:
     viewclass: 'CartRecycleItem'
     RecycleBoxLayout:
-        default_size: None, dp(85)
+        default_size: None, dp(94)
         default_size_hint: 1, None
         size_hint_y: None
         height: self.minimum_height
         orientation: 'vertical'
-        spacing: dp(1)
+        spacing: dp(8)
+        padding: [dp(12), dp(10), dp(12), dp(12)]
 '''
 
 
@@ -3078,14 +3434,18 @@ class RightButtonsContainer(IRightBodyTouch, MDBoxLayout):
 class CartRecycleItem(RecycleDataViewBehavior, MDCard):
     text_name = StringProperty('')
     text_details = StringProperty('')
+    text_subtotal = StringProperty('')
     details_color = ListProperty([0.4, 0.4, 0.4, 1])
+    badge_icon = StringProperty('package-variant')
     raw_data = ObjectProperty(None, allownone=True)
 
     def refresh_view_attrs(self, rv, index, data):
         self.index = index
         self.text_name = ar_visual(data.get('name', ''))
         self.text_details = data.get('details', '')
+        self.text_subtotal = data.get('subtotal', '')
         self.details_color = data.get('d_color', [0.4, 0.4, 0.4, 1])
+        self.badge_icon = data.get('badge_icon', 'package-variant')
         self.raw_data = data.get('raw_item')
         return super().refresh_view_attrs(rv, index, data)
 
@@ -3108,6 +3468,9 @@ class ProductRecycleItem(RecycleDataViewBehavior, MDBoxLayout):
     icon_name = StringProperty('package-variant')
     icon_color = ListProperty([0, 0, 0, 1])
     price_color = ListProperty([0, 0, 0, 1])
+    stock_color = ListProperty([0.15, 0.2, 0.25, 1])
+    stock_bg = ListProperty([0.94, 0.95, 0.97, 1])
+    thumb_bg = ListProperty([0.94, 0.96, 1, 1])
     image_path = StringProperty('')
     product_data = ObjectProperty(None, allownone=True)
 
@@ -3119,6 +3482,9 @@ class ProductRecycleItem(RecycleDataViewBehavior, MDBoxLayout):
         self.icon_name = data.get('icon_name', 'package-variant')
         self.icon_color = data.get('icon_color', [0, 0, 0, 1])
         self.price_color = data.get('price_color', [0, 0, 0, 1])
+        self.stock_color = data.get('stock_color', [0.15, 0.2, 0.25, 1])
+        self.stock_bg = data.get('stock_bg', [0.94, 0.95, 0.97, 1])
+        self.thumb_bg = data.get('thumb_bg', [0.94, 0.96, 1, 1])
         self.image_path = data.get('image_path', '')
         self.product_data = data.get('raw_data')
         return super().refresh_view_attrs(rv, index, data)
@@ -3135,7 +3501,6 @@ class ProductRecycleItem(RecycleDataViewBehavior, MDBoxLayout):
                 app.show_zoomed_image(self.image_path, self.text_name)
         else:
             self.on_tap()
-
 
 class HistoryRecycleItem(RecycleDataViewBehavior, MDCard):
     index = None
@@ -3188,42 +3553,60 @@ class MgmtEntityRecycleItem(RecycleDataViewBehavior, MDCard):
         self.entity_data = data.get('raw_data')
         return super().refresh_view_attrs(rv, index, data)
 
+    def _cancel_long_press(self):
+        if self._long_press_event:
+            self._long_press_event.cancel()
+            self._long_press_event = None
+
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):
             self._is_long_press = False
-            self._start_pos = touch.pos
-            self._long_press_event = Clock.schedule_once(lambda dt: self._trigger_long_press(), 0.45)
+            self._cancel_long_press()
+            btn_hist = self.ids.get('btn_hist')
+            if not (btn_hist and btn_hist.collide_point(*touch.pos)):
+                self._start_pos = touch.pos
+                self._long_press_event = Clock.schedule_once(lambda dt: self._trigger_long_press(), 0.55)
         return super().on_touch_down(touch)
 
     def on_touch_move(self, touch):
         if self._long_press_event:
             if abs(touch.x - self._start_pos[0]) > dp(20) or abs(touch.y - self._start_pos[1]) > dp(20):
-                self._long_press_event.cancel()
-                self._long_press_event = None
+                self._cancel_long_press()
         return super().on_touch_move(touch)
 
     def on_touch_up(self, touch):
-        if self._long_press_event:
-            self._long_press_event.cancel()
-            self._long_press_event = None
+        self._cancel_long_press()
         if self._is_long_press:
+            self._is_long_press = False
+            self.state = 'normal'
+            touch.ungrab(self)
             return True
         return super().on_touch_up(touch)
 
     def _trigger_long_press(self):
-        self._is_long_press = True
+        self._long_press_event = None
         app = MDApp.get_running_app()
+        if app and getattr(app, 'entity_hist_dialog', None) and app.entity_hist_dialog.parent:
+            return
+        self._is_long_press = True
+        self.state = 'normal'
         if app and self.entity_data:
             app.open_entity_edit_menu(self.entity_data)
 
     def on_pay(self):
+        self._cancel_long_press()
         if self._is_long_press:
             return
         app = MDApp.get_running_app()
+        if app and getattr(app, 'options_dialog', None) and app.options_dialog.parent:
+            return
         if app and self.entity_data:
             app.start_direct_payment_from_manager(self.entity_data)
 
     def on_history(self):
+        self._cancel_long_press()
+        self._is_long_press = False
+        self.state = 'normal'
         app = MDApp.get_running_app()
         if app and self.entity_data:
             app.open_entity_history_dialog(self.entity_data)
@@ -3235,6 +3618,8 @@ class EntityRecycleItem(RecycleDataViewBehavior, MDCard):
     text_balance = StringProperty('')
     icon_name = StringProperty('account')
     icon_color = ListProperty([0, 0, 0, 1])
+    bg_color = ColorProperty([1, 1, 1, 1])
+    icon_bg = ColorProperty([0.94, 0.96, 1, 1])
     entity_data = ObjectProperty(None, allownone=True)
 
     def refresh_view_attrs(self, rv, index, data):
@@ -3243,6 +3628,8 @@ class EntityRecycleItem(RecycleDataViewBehavior, MDCard):
         self.text_balance = data.get('balance_text', '')
         self.icon_name = data.get('icon', 'account')
         self.icon_color = data.get('icon_color', [0, 0, 0, 1])
+        self.bg_color = data.get('bg_color', [1, 1, 1, 1])
+        self.icon_bg = data.get('icon_bg', [0.94, 0.96, 1, 1])
         self.entity_data = data.get('raw_data')
         return super().refresh_view_attrs(rv, index, data)
 
@@ -3539,23 +3926,77 @@ class StockApp(MDApp):
         return os.path.join(os.path.expanduser('~'), '.magpro_mobile_sys.dat')
 
     def load_persistent_data(self) -> dict:
-        path = self._get_hidden_sys_file()
-        if os.path.exists(path):
+        candidates = []
+        ext_path = self._get_hidden_sys_file()
+        int_path = os.path.join(self.user_data_dir, '.magpro_sys_cache.dat')
+
+        for p in (ext_path, int_path):
+            if p and os.path.exists(p):
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        d = json.load(f)
+                        if isinstance(d, dict):
+                            candidates.append(d)
+                except Exception:
+                    pass
+
+        if getattr(self, 'db', None):
             try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                raw_db = self.db.get_setting('sys_trial_state', '')
+                if raw_db:
+                    d_db = json.loads(raw_db)
+                    if isinstance(d_db, dict):
+                        candidates.append(d_db)
             except Exception:
                 pass
-        return {'trial_start': None, 'attempts': 0}
+
+        if not candidates:
+            return {'trial_start': None, 'attempts': 0}
+
+        earliest_dt = None
+        earliest_str = None
+        max_attempts = 0
+        for c in candidates:
+            try:
+                max_attempts = max(max_attempts, int(c.get('attempts', 0) or 0))
+            except Exception:
+                pass
+            ts_str = c.get('trial_start')
+            if ts_str:
+                try:
+                    dt_obj = datetime.strptime(str(ts_str)[:19], '%Y-%m-%d %H:%M:%S')
+                    if earliest_dt is None or dt_obj < earliest_dt:
+                        earliest_dt = dt_obj
+                        earliest_str = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    pass
+
+        merged = {'trial_start': earliest_str, 'attempts': max_attempts}
+        if len(candidates) < 3 and earliest_str is not None:
+            self.save_persistent_data(merged)
+        return merged
 
     def save_persistent_data(self, data: dict):
-        path = self._get_hidden_sys_file()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+        ext_path = self._get_hidden_sys_file()
+        int_path = os.path.join(self.user_data_dir, '.magpro_sys_cache.dat')
+
+        for p in (ext_path, int_path):
+            if not p:
+                continue
+            try:
+                parent = os.path.dirname(p)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(p, 'w', encoding='utf-8') as f:
+                    json.dump(data, f)
+            except Exception:
+                pass
+
+        if getattr(self, 'db', None):
+            try:
+                self.db.set_setting('sys_trial_state', json.dumps(data))
+            except Exception:
+                pass
 
     def check_license_validity(self) -> tuple:
         try:
@@ -3703,8 +4144,6 @@ class StockApp(MDApp):
             self.online_act_btn.icon = 'cancel'
             self.online_act_btn.disabled = True
             return
-        p_data['attempts'] = attempts + 1
-        self.save_persistent_data(p_data)
         self.online_act_btn.text = 'Vérification...'
         self.online_act_btn.icon = 'sync'
         self.online_act_btn.disabled = True
@@ -3714,6 +4153,16 @@ class StockApp(MDApp):
         BOT_TOKEN = "GITHUB_SECRET_TELEGRAM_BOT_TOKEN"
         MASTER_ADMIN_ID = "GITHUB_SECRET_TELEGRAM_ADMIN_ID"
         device_id = self.get_device_id()
+
+        if "GITHUB_SECRET" in BOT_TOKEN or "GITHUB_SECRET" in MASTER_ADMIN_ID:
+            def not_configured(dt):
+                self.notify('❌ Service non configuré dans cette version.', 'error')
+                self.online_act_btn.text = "Demander l'activation en ligne"
+                self.online_act_btn.icon = 'earth'
+                self.online_act_btn.disabled = False
+            Clock.schedule_once(not_configured, 0)
+            return
+
         try:
             import requests
             requests.get('https://api.telegram.org', timeout=5)
@@ -3735,11 +4184,13 @@ class StockApp(MDApp):
             ]
         }
         try:
-            requests.post(
+            send_resp = requests.post(
                 f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
                 json={'chat_id': MASTER_ADMIN_ID, 'text': msg, 'parse_mode': 'Markdown', 'reply_markup': reply_markup},
                 timeout=10,
             )
+            if send_resp.status_code != 200:
+                raise RuntimeError(f'HTTP {send_resp.status_code}')
         except Exception:
             def no_server(dt):
                 self.notify("❌ Échec d'envoi au serveur", 'error')
@@ -3748,6 +4199,12 @@ class StockApp(MDApp):
                 self.online_act_btn.disabled = False
             Clock.schedule_once(no_server, 0)
             return
+
+        def _count_attempt(dt):
+            p_cur = self.load_persistent_data()
+            p_cur['attempts'] = int(p_cur.get('attempts', 0) or 0) + 1
+            self.save_persistent_data(p_cur)
+        Clock.schedule_once(_count_attempt, 0)
 
         Clock.schedule_once(lambda dt: setattr(self.online_act_btn, 'text', 'En attente du dev... (Ne pas fermer)'), 0)
         offset = None
@@ -3872,44 +4329,132 @@ class StockApp(MDApp):
         card = MDCard(
             orientation='vertical',
             size_hint=(0.88, None),
-            height=dp(360),
-            pos_hint={'center_x': 0.5, 'center_y': 0.52},
-            padding=[dp(25), dp(30), dp(25), dp(25)],
-            spacing=dp(15),
+            adaptive_height=True,
+            pos_hint={'center_x': 0.5, 'center_y': 0.53},
+            padding=[dp(24), dp(28), dp(24), dp(24)],
+            spacing=dp(14),
             radius=[24, 24, 24, 24],
             elevation=3,
             md_bg_color=(1, 1, 1, 1),
         )
-        icon_box = MDFloatLayout(size_hint_y=None, height=dp(65))
-        icon_box.add_widget(MDIcon(icon='store-check', font_size='58sp', pos_hint={'center_x': 0.5, 'center_y': 0.5}, theme_text_color='Custom', text_color=(0.1, 0.45, 0.85, 1)))
-        card.add_widget(icon_box)
-        card.add_widget(MDLabel(text=AppConstants.APP_NAME, halign='center', font_style='H5', bold=True, adaptive_height=True))
-        card.add_widget(MDLabel(text='Authentification', halign='center', font_style='Caption', theme_text_color='Secondary', adaptive_height=True))
 
-        self.password_field = SmartTextField(hint_text='Mot de passe', password=True, icon_right='lock-outline', halign='center')
-        card.add_widget(self.password_field)
-        card.add_widget(
-            MDFillRoundFlatButton(
-                text='SE CONNECTER',
-                font_size='16sp',
-                size_hint_x=1,
-                size_hint_y=None,
-                height=dp(50),
-                md_bg_color=(0.1, 0.45, 0.85, 1),
-                on_release=self.do_login,
+        icon_badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(78), dp(78)),
+            radius=[39],
+            elevation=0,
+            md_bg_color=(0.91, 0.95, 1, 1),
+            pos_hint={'center_x': 0.5},
+        )
+        icon_float = MDFloatLayout()
+        login_icon = MDIcon(
+            icon='store-check',
+            font_size='44sp',
+            size_hint=(None, None),
+            size=(dp(50), dp(50)),
+            halign='center',
+            valign='middle',
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            theme_text_color='Custom',
+            text_color=(0.1, 0.45, 0.85, 1),
+        )
+        Clock.schedule_once(lambda dt: setattr(login_icon, 'font_size', '44sp'), 0)
+        icon_float.add_widget(login_icon)
+        icon_badge.add_widget(icon_float)
+        card.add_widget(icon_badge)
+
+        title_box = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True, spacing=dp(4))
+        title_box.add_widget(MDLabel(text=AppConstants.APP_NAME, halign='center', font_style='H5', bold=True, adaptive_height=True, theme_text_color='Custom', text_color=(0.12, 0.14, 0.18, 1)))
+        title_box.add_widget(MDLabel(text='Authentification', halign='center', font_style='Caption', theme_text_color='Secondary', adaptive_height=True))
+        card.add_widget(title_box)
+
+        pass_card = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(56),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.95, 0.96, 0.98, 1),
+            line_color=(0.85, 0.88, 0.94, 1),
+            line_width=1,
+            padding=[dp(14), 0, dp(4), 0],
+            spacing=dp(8),
+        )
+        pass_card.add_widget(
+            MDIcon(
+                icon='lock-outline',
+                theme_text_color='Custom',
+                text_color=(0.1, 0.45, 0.85, 1),
+                font_size='22sp',
+                size_hint_x=None,
+                width=dp(24),
+                pos_hint={'center_y': 0.5},
             )
         )
+        self.password_field = SmartTextField(
+            hint_text='Mot de passe',
+            password=True,
+            mode='line',
+            line_color_normal=(0, 0, 0, 0),
+            line_color_focus=(0, 0, 0, 0),
+            pos_hint={'center_y': 0.5},
+        )
+        self.password_field.bind(on_text_validate=self.do_login)
+        pass_card.add_widget(self.password_field)
+
+        def _toggle_pw(btn_inst):
+            self.password_field.password = not self.password_field.password
+            btn_inst.icon = 'eye-off-outline' if self.password_field.password else 'eye-outline'
+
+        pass_card.add_widget(
+            MDIconButton(
+                icon='eye-off-outline',
+                theme_text_color='Secondary',
+                icon_size='20sp',
+                pos_hint={'center_y': 0.5},
+                on_release=_toggle_pw,
+            )
+        )
+        card.add_widget(pass_card)
+
+        btn_login = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(50),
+            radius=[12],
+            elevation=2,
+            md_bg_color=(0.1, 0.45, 0.85, 1),
+            ripple_behavior=True,
+            spacing=dp(8),
+            on_release=self.do_login,
+        )
+        btn_login.add_widget(MDBoxLayout())
+        btn_login.add_widget(MDIcon(icon='login', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        btn_login.add_widget(MDLabel(text='SE CONNECTER', bold=True, font_size='16sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_login.add_widget(MDBoxLayout())
+        card.add_widget(btn_login)
+
         layout.add_widget(card)
 
-        layout.add_widget(
-            MDFlatButton(
-                text='Changer / Définir le mot de passe',
-                pos_hint={'center_x': 0.5, 'y': 0.1},
-                theme_text_color='Custom',
-                text_color=(0.35, 0.35, 0.4, 1),
-                on_release=self.show_change_password_dialog_login,
-            )
+        btn_chg_pw = MDCard(
+            orientation='horizontal',
+            size_hint=(None, None),
+            size=(dp(260), dp(40)),
+            pos_hint={'center_x': 0.5, 'y': 0.09},
+            radius=[20],
+            elevation=0,
+            md_bg_color=(0.89, 0.91, 0.95, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            padding=[dp(14), 0],
+            on_release=self.show_change_password_dialog_login,
         )
+        btn_chg_pw.add_widget(MDBoxLayout())
+        btn_chg_pw.add_widget(MDIcon(icon='key-change', theme_text_color='Custom', text_color=(0.25, 0.3, 0.4, 1), font_size='18sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+        btn_chg_pw.add_widget(MDLabel(text='Changer / Définir le mot de passe', font_style='Caption', bold=True, theme_text_color='Custom', text_color=(0.25, 0.3, 0.4, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_chg_pw.add_widget(MDBoxLayout())
+        layout.add_widget(btn_chg_pw)
+
         layout.add_widget(
             MDLabel(
                 text=f'{AppConstants.APP_NAME} v{AppConstants.APP_VERSION} © {AppConstants.COPYRIGHT_YEAR}',
@@ -4000,13 +4545,98 @@ class StockApp(MDApp):
     # --------------------------------------------------------------------------
     def _build_dashboard_screen(self):
         screen = MDScreen(name='dashboard')
+        screen.md_bg_color = (0.95, 0.96, 0.98, 1)
         layout = MDBoxLayout(orientation='vertical')
-        self.dash_toolbar = MDTopAppBar(
-            title='Accueil',
-            anchor_title='center',
-            left_action_items=[['clipboard-text-clock', lambda x: self.show_pending_dialog()]],
-            right_action_items=[['cog', lambda x: self.open_settings_menu()], ['logout', lambda x: self.logout()]],
+
+        self.dash_toolbar = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(64),
+            radius=[0, 0, 20, 20],
+            elevation=3,
+            md_bg_color=(0.09, 0.44, 0.84, 1),
+            padding=[dp(12), dp(8), dp(12), dp(8)],
+            spacing=dp(10),
         )
+
+        btn_history = MDCard(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=dp(40),
+            adaptive_width=True,
+            radius=[20],
+            elevation=0,
+            md_bg_color=(1, 1, 1, 0.18),
+            line_color=(1, 1, 1, 0.28),
+            line_width=1,
+            ripple_behavior=True,
+            padding=[dp(14), 0, dp(16), 0],
+            spacing=dp(8),
+            pos_hint={'center_y': 0.5},
+            on_release=lambda x: self.show_pending_dialog(),
+        )
+        hist_ico = MDIcon(
+            icon='history',
+            font_size='22sp',
+            size_hint=(None, None),
+            size=(dp(24), dp(24)),
+            halign='center',
+            valign='middle',
+            pos_hint={'center_y': 0.5},
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+        )
+        Clock.schedule_once(lambda dt, i=hist_ico: setattr(i, 'font_size', '22sp'), 0)
+        btn_history.add_widget(hist_ico)
+        btn_history.add_widget(
+            MDLabel(
+                text='HISTORIQUE',
+                bold=True,
+                font_size='13sp',
+                theme_text_color='Custom',
+                text_color=(1, 1, 1, 1),
+                adaptive_width=True,
+                valign='middle',
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        self.dash_toolbar.add_widget(btn_history)
+
+        self.dash_toolbar.add_widget(MDBoxLayout(size_hint_x=1))
+
+        def _make_hdr_btn(icon_name: str, bg_c, cb):
+            btn = MDCard(
+                size_hint=(None, None),
+                size=(dp(40), dp(40)),
+                radius=[20],
+                elevation=0,
+                md_bg_color=bg_c,
+                ripple_behavior=True,
+                pos_hint={'center_y': 0.5},
+                on_release=cb,
+            )
+            fl = MDFloatLayout()
+            ic = MDIcon(
+                icon=icon_name,
+                font_size='21sp',
+                size_hint=(None, None),
+                size=(dp(24), dp(24)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                theme_text_color='Custom',
+                text_color=(1, 1, 1, 1),
+            )
+            Clock.schedule_once(lambda dt, i=ic: setattr(i, 'font_size', '21sp'), 0)
+            fl.add_widget(ic)
+            btn.add_widget(fl)
+            return btn
+
+        actions_hdr = MDBoxLayout(orientation='horizontal', adaptive_width=True, spacing=dp(8), pos_hint={'center_y': 0.5})
+        actions_hdr.add_widget(_make_hdr_btn('cog-outline', (1, 1, 1, 0.16), lambda x: self.open_settings_menu()))
+        actions_hdr.add_widget(_make_hdr_btn('logout', (0.95, 0.25, 0.25, 0.35), lambda x: self.logout()))
+        self.dash_toolbar.add_widget(actions_hdr)
+
         layout.add_widget(self.dash_toolbar)
         scroll = MDScrollView()
         self.main_dash_content = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(18), padding=dp(15))
@@ -4019,7 +4649,7 @@ class StockApp(MDApp):
             adaptive_height=True,
             padding=dp(15),
             radius=[20],
-            elevation=2,
+            elevation=1,
             md_bg_color=(1, 1, 1, 1),
         )
         self.main_dash_content.add_widget(self.stats_card_container)
@@ -4029,41 +4659,89 @@ class StockApp(MDApp):
         return screen
 
     def _create_dash_btn(self, icon: str, text: str, bg_color, icon_color, action):
+        from kivy.graphics import Color, RoundedRectangle
+
         card = MDCard(
             orientation='vertical',
-            padding=dp(15),
-            radius=[14],
+            padding=[dp(8), dp(12), dp(8), dp(10)],
+            spacing=dp(8),
+            radius=[16],
             ripple_behavior=True,
             on_release=action,
             md_bg_color=bg_color,
-            elevation=2,
+            line_color=(0, 0, 0, 0.06),
+            line_width=1,
+            elevation=1,
             size_hint_y=None,
-            height=dp(108),
+            height=dp(106),
         )
-        card.add_widget(MDIcon(icon=icon, font_size='36sp', pos_hint={'center_x': 0.5}, theme_text_color='Custom', text_color=icon_color))
-        card.add_widget(MDLabel(text=text, halign='center', bold=True, font_style='Caption'))
+        badge = MDFloatLayout(
+            size_hint=(None, None),
+            size=(dp(50), dp(50)),
+            pos_hint={'center_x': 0.5},
+        )
+        with badge.canvas.before:
+            Color(1, 1, 1, 0.85)
+            bg_circle = RoundedRectangle(pos=badge.pos, size=badge.size, radius=[dp(25)])
+        badge.bind(
+            pos=lambda inst, val, r=bg_circle: setattr(r, 'pos', val),
+            size=lambda inst, val, r=bg_circle: setattr(r, 'size', val),
+        )
+        ico = MDIcon(
+            icon=icon,
+            font_size='30sp',
+            size_hint=(None, None),
+            size=(dp(34), dp(34)),
+            halign='center',
+            valign='middle',
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            theme_text_color='Custom',
+            text_color=icon_color,
+        )
+        Clock.schedule_once(lambda dt, i=ico: setattr(i, 'font_size', '30sp'), 0)
+        badge.add_widget(ico)
+        card.add_widget(badge)
+        card.add_widget(
+            MDLabel(
+                text=text,
+                halign='center',
+                valign='middle',
+                bold=True,
+                font_size='12.5sp',
+                theme_text_color='Custom',
+                text_color=(0.15, 0.17, 0.22, 1),
+                adaptive_height=True,
+            )
+        )
         return card
 
     def update_dashboard_layout(self):
         if not getattr(self, 'buttons_container', None) or not getattr(self, 'stats_card_container', None):
             return
+        if self.sm and self.sm.has_screen('dashboard'):
+            self.sm.get_screen('dashboard').md_bg_color = (0.95, 0.96, 0.98, 1)
+        if getattr(self, 'lbl_header_store', None):
+            s_name = (self.db.get_store_info().get('store_name') or '').strip() if self.db else ''
+            self.lbl_header_store.text = self.fix_text(s_name) if s_name else AppConstants.APP_NAME
+        if getattr(self, 'lbl_header_role', None):
+            self.lbl_header_role.text = 'Mode Vendeur' if self.is_seller_mode else 'Mode Administrateur'
         self.buttons_container.clear_widgets()
 
-        c_bv = ((0.88, 0.97, 0.9, 1), (0.1, 0.6, 0.2, 1))
-        c_ba = ((1.0, 0.94, 0.84, 1), (0.9, 0.4, 0.0, 1))
-        c_fc = ((0.88, 0.94, 1.0, 1), (0.0, 0.3, 0.7, 1))
-        c_ff = ((0.98, 0.88, 0.88, 1), (0.7, 0.1, 0.2, 1))
-        c_fp = ((0.94, 0.88, 1.0, 1), (0.5, 0.1, 0.6, 1))
+        c_bv = ((0.88, 0.97, 0.9, 1), (0.08, 0.58, 0.2, 1))
+        c_ba = ((1.0, 0.94, 0.84, 1), (0.88, 0.4, 0.0, 1))
+        c_fc = ((0.88, 0.94, 1.0, 1), (0.0, 0.32, 0.75, 1))
+        c_ff = ((0.98, 0.88, 0.88, 1), (0.72, 0.1, 0.2, 1))
+        c_fp = ((0.94, 0.88, 1.0, 1), (0.5, 0.1, 0.65, 1))
         c_dp = ((0.85, 0.97, 0.97, 1), (0.0, 0.5, 0.5, 1))
         c_bs = ((0.95, 0.92, 0.88, 1), (0.5, 0.3, 0.1, 1))
-        c_be = ((0.9, 0.9, 0.98, 1), (0.2, 0.2, 0.7, 1))
-        c_rc = ((1.0, 0.85, 0.85, 1), (0.9, 0.0, 0.0, 1))
-        c_rf = ((1.0, 0.88, 0.95, 1), (0.8, 0.1, 0.5, 1))
-        c_tr = ((0.92, 0.94, 0.96, 1), (0.3, 0.4, 0.5, 1))
-        c_pr = ((1.0, 0.97, 0.85, 1), (0.7, 0.6, 0.0, 1))
-        c_cl = ((0.85, 0.95, 1.0, 1), (0.0, 0.6, 0.8, 1))
-        c_fo = ((0.96, 0.93, 0.9, 1), (0.6, 0.4, 0.2, 1))
-        c_de = ((0.99, 0.88, 0.88, 1), (0.8, 0.0, 0.0, 1))
+        c_be = ((0.9, 0.91, 0.99, 1), (0.2, 0.25, 0.72, 1))
+        c_rc = ((1.0, 0.86, 0.86, 1), (0.85, 0.05, 0.05, 1))
+        c_rf = ((1.0, 0.89, 0.95, 1), (0.78, 0.1, 0.5, 1))
+        c_tr = ((0.91, 0.94, 0.97, 1), (0.28, 0.38, 0.48, 1))
+        c_pr = ((1.0, 0.96, 0.84, 1), (0.72, 0.55, 0.0, 1))
+        c_cl = ((0.86, 0.95, 1.0, 1), (0.0, 0.55, 0.78, 1))
+        c_fo = ((0.96, 0.93, 0.9, 1), (0.58, 0.38, 0.2, 1))
+        c_de = ((0.99, 0.88, 0.88, 1), (0.8, 0.05, 0.05, 1))
 
         if self.is_seller_mode:
             self.buttons_container.add_widget(self._create_dash_btn('cart', 'VENTE (BV)', c_bv[0], c_bv[1], lambda x: self.open_mode('sale')))
@@ -4098,101 +4776,190 @@ class StockApp(MDApp):
             setattr(self, attr_name, None)
 
         self.stats_card_container.clear_widgets()
+        self.stats_card_container.padding = dp(14)
         self.stats_card_container.spacing = dp(12)
+        self.stats_card_container.line_color = (0.89, 0.91, 0.94, 1)
+        self.stats_card_container.line_width = 1
+        self.stats_card_container.elevation = 0
+
+        class _StatTabPill(MDCard):
+            text = StringProperty('')
+            text_color = ColorProperty([0.35, 0.38, 0.45, 1])
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.size_hint_x = 1
+                self.size_hint_y = 1
+                self.radius = [9]
+                self.elevation = 0
+                self.ripple_behavior = True
+                self._lbl = MDLabel(
+                    text=self.text,
+                    bold=True,
+                    font_size='11.5sp',
+                    halign='center',
+                    valign='middle',
+                    theme_text_color='Custom',
+                    text_color=self.text_color,
+                )
+                self.add_widget(self._lbl)
+                self.bind(
+                    text=lambda inst, val: setattr(self._lbl, 'text', val),
+                    text_color=lambda inst, val: setattr(self._lbl, 'text_color', val),
+                )
 
         header_box = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True, spacing=dp(10))
-        self.lbl_dashboard_date = MDLabel(text="Tableau de Bord (Aujourd'hui)", font_style='H6', bold=True, theme_text_color='Primary', halign='center', size_hint_y=None, height=dp(28))
+        self.lbl_dashboard_date = MDLabel(
+            text="Tableau de Bord (Aujourd'hui)",
+            font_style='Subtitle1',
+            font_size='17sp',
+            bold=True,
+            theme_text_color='Primary',
+            halign='center',
+            size_hint_y=None,
+            height=dp(26),
+        )
         header_box.add_widget(self.lbl_dashboard_date)
 
-        tabs_wrapper = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(36), spacing=dp(5), adaptive_width=True, pos_hint={'center_x': 0.5})
-        self.btn_stat_today = MDRaisedButton(text='AUJ', size_hint_x=None, width=dp(54), font_size='11sp', elevation=0, on_release=lambda x: self.filter_dashboard_stats('auj'))
-        self.btn_stat_yesterday = MDRaisedButton(text='HIE', size_hint_x=None, width=dp(54), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=lambda x: self.filter_dashboard_stats('hier'))
-        self.btn_stat_week = MDRaisedButton(text='SEM', size_hint_x=None, width=dp(54), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=lambda x: self.filter_dashboard_stats('semaine'))
-        self.btn_stat_month = MDRaisedButton(text='MOI', size_hint_x=None, width=dp(54), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=lambda x: self.filter_dashboard_stats('mois'))
-        self.btn_stat_date = MDRaisedButton(text='CAL', size_hint_x=None, width=dp(54), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=self.open_stats_date_picker)
+        tabs_container = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(42),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.94, 0.95, 0.97, 1),
+            line_color=(0.88, 0.90, 0.94, 1),
+            line_width=1,
+            padding=dp(4),
+            spacing=dp(4),
+        )
+        self.btn_stat_today = _StatTabPill(text='AUJ', on_release=lambda x: self.filter_dashboard_stats('auj'))
+        self.btn_stat_yesterday = _StatTabPill(text='HIE', on_release=lambda x: self.filter_dashboard_stats('hier'))
+        self.btn_stat_week = _StatTabPill(text='SEM', on_release=lambda x: self.filter_dashboard_stats('semaine'))
+        self.btn_stat_month = _StatTabPill(text='MOI', on_release=lambda x: self.filter_dashboard_stats('mois'))
+        self.btn_stat_date = _StatTabPill(text='CAL', on_release=self.open_stats_date_picker)
         for b in (self.btn_stat_today, self.btn_stat_yesterday, self.btn_stat_week, self.btn_stat_month, self.btn_stat_date):
-            tabs_wrapper.add_widget(b)
-        header_box.add_widget(tabs_wrapper)
+            tabs_container.add_widget(b)
+        header_box.add_widget(tabs_container)
         self.stats_card_container.add_widget(header_box)
 
         def _stat_card(icon: str, title: str, attr_name: str, bg_c, ic_c):
-            c = MDCard(orientation='vertical', padding=dp(12), radius=[14], md_bg_color=bg_c, elevation=0, size_hint_y=None, height=dp(100))
-            top = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(26), spacing=dp(6))
-            top.add_widget(MDIcon(icon=icon, theme_text_color='Custom', text_color=ic_c, font_size='22sp', size_hint_x=None, width=dp(26)))
-            top.add_widget(MDLabel(text=title, halign='left', font_style='Caption', bold=True, theme_text_color='Secondary'))
-            lbl = MDLabel(text='0,00 DA', halign='center', font_style='H6', bold=True, theme_text_color='Custom', text_color=(0.15, 0.15, 0.15, 1))
+            c = MDCard(
+                orientation='vertical',
+                padding=[dp(10), dp(10)],
+                spacing=dp(8),
+                radius=[14],
+                md_bg_color=bg_c,
+                line_color=(ic_c[0], ic_c[1], ic_c[2], 0.22),
+                line_width=1,
+                elevation=0,
+                size_hint_y=None,
+                height=dp(88),
+            )
+            top = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(28), spacing=dp(6))
+            ico_badge = MDCard(
+                size_hint=(None, None),
+                size=(dp(28), dp(28)),
+                radius=[14],
+                elevation=0,
+                md_bg_color=(1, 1, 1, 0.88),
+                pos_hint={'center_y': 0.5},
+            )
+            ico_fl = MDFloatLayout()
+            ico_fl.add_widget(
+                MDIcon(
+                    icon=icon,
+                    theme_text_color='Custom',
+                    text_color=ic_c,
+                    font_size='17sp',
+                    size_hint=(None, None),
+                    size=(dp(20), dp(20)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                )
+            )
+            ico_badge.add_widget(ico_fl)
+            top.add_widget(ico_badge)
+            top.add_widget(
+                MDLabel(
+                    text=title,
+                    halign='left',
+                    valign='middle',
+                    font_style='Caption',
+                    font_size='11.5sp',
+                    bold=True,
+                    theme_text_color='Custom',
+                    text_color=(0.35, 0.38, 0.45, 1),
+                    shorten=True,
+                )
+            )
+            lbl = MDLabel(
+                text='0,00 DA',
+                halign='center',
+                valign='middle',
+                font_style='Subtitle1',
+                font_size='16.5sp',
+                bold=True,
+                theme_text_color='Custom',
+                text_color=(0.1, 0.12, 0.16, 1),
+                shorten=True,
+            )
             setattr(self, attr_name, lbl)
             c.add_widget(top)
-            c.add_widget(MDBoxLayout(size_hint_y=None, height=dp(8)))
             c.add_widget(lbl)
             return c
 
         if self.is_seller_mode:
             self.stats_more_container = None
             stats_grid = MDGridLayout(cols=2, spacing=dp(10), adaptive_height=True)
-            stats_grid.add_widget(_stat_card('cart-outline', 'Ventes Nettes', 'lbl_stat_sales', (0.9, 0.95, 1, 1), (0, 0.35, 0.8, 1)))
-            stats_grid.add_widget(_stat_card('cash-plus', 'Encaissements', 'lbl_stat_in', (0.92, 0.98, 0.92, 1), (0, 0.6, 0.2, 1)))
+            stats_grid.add_widget(_stat_card('cart-outline', 'Ventes Nettes', 'lbl_stat_sales', (0.91, 0.95, 1, 1), (0.06, 0.4, 0.82, 1)))
+            stats_grid.add_widget(_stat_card('cash-plus', 'Encaissements', 'lbl_stat_in', (0.91, 0.98, 0.92, 1), (0.04, 0.58, 0.22, 1)))
             self.stats_card_container.add_widget(stats_grid)
         else:
             caisse_card = MDCard(
-                radius=[16],
-                md_bg_color=(0.98, 0.99, 0.98, 1),
-                line_color=(0.88, 0.91, 0.9, 1),
-                line_width=1,
-                elevation=2,
-                size_hint_y=None,
-                height=dp(118),
-            )
-            caisse_float = MDFloatLayout()
-            caisse_float.add_widget(
-                MDIcon(
-                    icon='cash-multiple',
-                    theme_text_color='Custom',
-                    text_color=(0.05, 0.55, 0.25, 1),
-                    font_size='28sp',
-                    pos_hint={'x': 0.04, 'top': 0.88},
-                    size_hint=(None, None),
-                    size=(dp(30), dp(30)),
-                )
-            )
-            caisse_center = MDBoxLayout(
                 orientation='vertical',
-                adaptive_height=True,
+                radius=[16],
+                md_bg_color=(0.94, 0.99, 0.96, 1),
+                line_color=(0.74, 0.89, 0.79, 1),
+                line_width=1.2,
+                elevation=0,
+                size_hint_y=None,
+                height=dp(108),
+                padding=[dp(14), dp(12)],
                 spacing=dp(4),
-                padding=[dp(12), 0],
-                pos_hint={'center_x': 0.5, 'center_y': 0.48},
             )
-            caisse_center.add_widget(
+            caisse_top = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(28), spacing=dp(8), adaptive_width=True, pos_hint={'center_x': 0.5})
+            caisse_badge = MDCard(size_hint=(None, None), size=(dp(28), dp(28)), radius=[14], elevation=0, md_bg_color=(0.84, 0.96, 0.88, 1), pos_hint={'center_y': 0.5})
+            c_fl = MDFloatLayout()
+            c_fl.add_widget(MDIcon(icon='cash-multiple', theme_text_color='Custom', text_color=(0.04, 0.55, 0.24, 1), font_size='18sp', size_hint=(None, None), size=(dp(20), dp(20)), halign='center', valign='middle', pos_hint={'center_x': 0.5, 'center_y': 0.5}))
+            caisse_badge.add_widget(c_fl)
+            caisse_top.add_widget(caisse_badge)
+            caisse_top.add_widget(MDLabel(text='TOTAL EN CAISSE', bold=True, font_style='Subtitle2', theme_text_color='Custom', text_color=(0.06, 0.38, 0.18, 1), adaptive_width=True, valign='middle', pos_hint={'center_y': 0.5}))
+            caisse_card.add_widget(caisse_top)
+
+            caisse_card.add_widget(
                 MDLabel(
-                    text='TOTAL EN CAISSE',
-                    halign='center',
-                    font_style='Subtitle1',
-                    bold=True,
-                    theme_text_color='Primary',
-                    adaptive_height=True,
-                )
-            )
-            caisse_center.add_widget(
-                MDLabel(
-                    text='(Ventes payées + Versements - RC Comptoir - Dépenses)',
+                    text='(Ventes payées + Versements - Dépenses)',
                     halign='center',
                     font_style='Caption',
-                    theme_text_color='Hint',
-                    adaptive_height=True,
+                    font_size='11sp',
+                    theme_text_color='Secondary',
+                    size_hint_y=None,
+                    height=dp(16),
                 )
             )
             self.lbl_stat_caisse = MDLabel(
                 text='0,00 DA',
                 halign='center',
+                valign='middle',
                 font_style='H5',
+                font_size='23sp',
                 bold=True,
                 theme_text_color='Custom',
-                text_color=(0.1, 0.1, 0.1, 1),
-                adaptive_height=True,
+                text_color=(0.08, 0.1, 0.14, 1),
             )
-            caisse_center.add_widget(self.lbl_stat_caisse)
-            caisse_float.add_widget(caisse_center)
-            caisse_card.add_widget(caisse_float)
+            caisse_card.add_widget(self.lbl_stat_caisse)
             self.stats_card_container.add_widget(caisse_card)
 
             self.is_stats_expanded = False
@@ -4201,7 +4968,9 @@ class StockApp(MDApp):
                 size_hint_y=None,
                 height=dp(42),
                 radius=[12],
-                md_bg_color=(0.93, 0.95, 0.99, 1),
+                md_bg_color=(0.93, 0.96, 1, 1),
+                line_color=(0.82, 0.88, 0.97, 1),
+                line_width=1,
                 elevation=0,
                 ripple_behavior=True,
                 spacing=dp(6),
@@ -4212,14 +4981,14 @@ class StockApp(MDApp):
                 font_style='Caption',
                 bold=True,
                 theme_text_color='Custom',
-                text_color=self.theme_cls.primary_color,
+                text_color=(0.09, 0.44, 0.84, 1),
                 adaptive_width=True,
                 pos_hint={'center_y': 0.5},
             )
             self.ico_stats_toggle = MDIcon(
                 icon='chevron-down',
                 theme_text_color='Custom',
-                text_color=self.theme_cls.primary_color,
+                text_color=(0.09, 0.44, 0.84, 1),
                 font_size='20sp',
                 size_hint_x=None,
                 width=dp(22),
@@ -4233,18 +5002,18 @@ class StockApp(MDApp):
 
             self.stats_more_container = MDBoxLayout(orientation='vertical', spacing=dp(10), adaptive_height=True)
             stats_grid = MDGridLayout(cols=2, spacing=dp(10), adaptive_height=True)
-            stats_grid.add_widget(_stat_card('cart-outline', 'Ventes Nettes', 'lbl_stat_sales', (0.9, 0.95, 1, 1), (0, 0.35, 0.8, 1)))
-            stats_grid.add_widget(_stat_card('cash-plus', 'Encaissements', 'lbl_stat_in', (0.92, 0.98, 0.92, 1), (0, 0.6, 0.2, 1)))
-            stats_grid.add_widget(_stat_card('truck-outline', 'Achats Nets', 'lbl_stat_purchases', (1, 0.95, 0.86, 1), (0.9, 0.5, 0, 1)))
-            stats_grid.add_widget(_stat_card('cash-minus', 'Décaissements', 'lbl_stat_out', (1, 0.91, 0.91, 1), (0.8, 0.1, 0.1, 1)))
-            stats_grid.add_widget(_stat_card('chart-line-variant', 'Bénéfice Net', 'lbl_stat_profit', (0.94, 0.9, 0.99, 1), (0.5, 0.1, 0.7, 1)))
-            stats_grid.add_widget(_stat_card('cash-remove', 'Dépenses', 'lbl_stat_expenses', (1, 0.94, 0.88, 1), (0.85, 0.35, 0, 1)))
-            stats_grid.add_widget(_stat_card('account-cash', 'Créances Clients', 'lbl_stat_client_debts', (0.9, 1, 0.92, 1), (0, 0.6, 0.2, 1)))
-            stats_grid.add_widget(_stat_card('account-credit-card', 'Dettes Fourniss.', 'lbl_stat_supplier_dues', (1, 0.88, 0.88, 1), (0.8, 0, 0, 1)))
+            stats_grid.add_widget(_stat_card('cart-outline', 'Ventes Nettes', 'lbl_stat_sales', (0.91, 0.95, 1, 1), (0.06, 0.4, 0.82, 1)))
+            stats_grid.add_widget(_stat_card('cash-plus', 'Encaissements', 'lbl_stat_in', (0.91, 0.98, 0.92, 1), (0.04, 0.58, 0.22, 1)))
+            stats_grid.add_widget(_stat_card('truck-outline', 'Achats Nets', 'lbl_stat_purchases', (1, 0.96, 0.88, 1), (0.88, 0.45, 0, 1)))
+            stats_grid.add_widget(_stat_card('cash-minus', 'Décaissements', 'lbl_stat_out', (1, 0.92, 0.92, 1), (0.82, 0.12, 0.12, 1)))
+            stats_grid.add_widget(_stat_card('chart-line-variant', 'Bénéfice Net', 'lbl_stat_profit', (0.95, 0.91, 1, 1), (0.48, 0.12, 0.72, 1)))
+            stats_grid.add_widget(_stat_card('cash-remove', 'Dépenses', 'lbl_stat_expenses', (1, 0.94, 0.89, 1), (0.85, 0.35, 0, 1)))
+            stats_grid.add_widget(_stat_card('account-cash', 'Créances Clients', 'lbl_stat_client_debts', (0.91, 0.99, 0.93, 1), (0.04, 0.58, 0.22, 1)))
+            stats_grid.add_widget(_stat_card('account-credit-card', 'Dettes Fourniss.', 'lbl_stat_supplier_dues', (1, 0.91, 0.91, 1), (0.8, 0.08, 0.08, 1)))
             self.stats_more_container.add_widget(stats_grid)
 
-            stock_card = _stat_card('package-variant', 'Stock (Coût)', 'lbl_stat_stock_val', (0.92, 0.97, 0.97, 1), (0, 0.5, 0.5, 1))
-            stock_card.height = dp(92)
+            stock_card = _stat_card('package-variant', 'Stock (Coût)', 'lbl_stat_stock_val', (0.92, 0.97, 0.97, 1), (0, 0.5, 0.52, 1))
+            stock_card.height = dp(82)
             self.stats_more_container.add_widget(stock_card)
 
         self.filter_dashboard_stats('auj')
@@ -4274,33 +5043,42 @@ class StockApp(MDApp):
         dp_dlg.open()
 
     def filter_dashboard_stats(self, filter_type: str = 'auj', specific_start=None, specific_end=None):
-        inact, act = (0.5, 0.5, 0.5, 1), self.theme_cls.primary_color
+        inact_bg, act_bg = (0.94, 0.95, 0.97, 1), (0.09, 0.44, 0.84, 1)
+        inact_txt, act_txt = (0.35, 0.38, 0.45, 1), (1, 1, 1, 1)
         for b in (self.btn_stat_today, self.btn_stat_yesterday, self.btn_stat_week, self.btn_stat_month, self.btn_stat_date):
-            b.md_bg_color = inact
+            b.md_bg_color = inact_bg
+            if hasattr(b, 'text_color'):
+                b.text_color = inact_txt
+
         today = datetime.now().date()
         start_d, end_d = today, today
 
+        def _activate(btn):
+            btn.md_bg_color = act_bg
+            if hasattr(btn, 'text_color'):
+                btn.text_color = act_txt
+
         if filter_type == 'custom' and specific_start:
             start_d, end_d = specific_start, (specific_end or specific_start)
-            self.btn_stat_date.md_bg_color = act
+            _activate(self.btn_stat_date)
             self.btn_stat_date.text = start_d.strftime('%d/%m') if start_d == end_d else 'CAL'
             self.lbl_dashboard_date.text = f"Tableau de Bord ({start_d.strftime('%d/%m')} - {end_d.strftime('%d/%m')})" if start_d != end_d else f"Tableau de Bord ({start_d.strftime('%d/%m/%Y')})"
         else:
             self.btn_stat_date.text = 'CAL'
             if filter_type == 'auj':
-                self.btn_stat_today.md_bg_color = act
+                _activate(self.btn_stat_today)
                 self.lbl_dashboard_date.text = "Tableau de Bord (Aujourd'hui)"
             elif filter_type == 'hier':
                 start_d = end_d = today - timedelta(days=1)
-                self.btn_stat_yesterday.md_bg_color = act
+                _activate(self.btn_stat_yesterday)
                 self.lbl_dashboard_date.text = 'Tableau de Bord (Hier)'
             elif filter_type == 'semaine':
                 start_d = today - timedelta(days=(today.weekday() + 2) % 7)
-                self.btn_stat_week.md_bg_color = act
+                _activate(self.btn_stat_week)
                 self.lbl_dashboard_date.text = 'Tableau de Bord (Cette semaine)'
             elif filter_type == 'mois':
                 start_d = today.replace(day=1)
-                self.btn_stat_month.md_bg_color = act
+                _activate(self.btn_stat_month)
                 self.lbl_dashboard_date.text = 'Tableau de Bord (Ce mois)'
 
         self.stats_start_date = str(start_d)
@@ -4340,47 +5118,333 @@ class StockApp(MDApp):
     # --------------------------------------------------------------------------
     # 7.4 ÉCRAN PRODUITS, RECHERCHE, FAMILLES & FICHE PRODUIT
     # --------------------------------------------------------------------------
+
+
+    def _create_modern_header(self, title: str, on_back, mode_icon: str = 'cart', on_right=None):
+        class _ModernHeaderBar(MDCard):
+            title = StringProperty('')
+            subtitle = StringProperty('')
+            mode_icon = StringProperty('cart')
+
+            def __init__(self, back_cb, right_cb, **kwargs):
+                super().__init__(**kwargs)
+                self.orientation = 'horizontal'
+                self.size_hint = (1, None)
+                self.height = dp(64)
+                self.radius = [0, 0, 20, 20]
+                self.elevation = 3
+                self.padding = [dp(12), dp(8), dp(12), dp(8)]
+                self.spacing = dp(12)
+
+                btn_back = MDCard(
+                    size_hint=(None, None),
+                    size=(dp(40), dp(40)),
+                    radius=[20],
+                    elevation=0,
+                    md_bg_color=(1, 1, 1, 0.18),
+                    line_color=(1, 1, 1, 0.25),
+                    line_width=1,
+                    ripple_behavior=True,
+                    pos_hint={'center_y': 0.5},
+                    on_release=back_cb,
+                )
+                back_fl = MDFloatLayout()
+                back_ico = MDIcon(
+                    icon='arrow-left',
+                    font_size='22sp',
+                    size_hint=(None, None),
+                    size=(dp(24), dp(24)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 1),
+                )
+                Clock.schedule_once(lambda dt, i=back_ico: setattr(i, 'font_size', '22sp'), 0)
+                back_fl.add_widget(back_ico)
+                btn_back.add_widget(back_fl)
+                self.add_widget(btn_back)
+
+                center_box = MDBoxLayout(
+                    orientation='vertical',
+                    size_hint_x=1,
+                    adaptive_height=True,
+                    spacing=dp(2),
+                    pos_hint={'center_y': 0.5},
+                )
+                self._lbl_title = MDLabel(
+                    text=self.title,
+                    bold=True,
+                    font_size='18sp',
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 1),
+                    halign='left',
+                    shorten=True,
+                    shorten_from='right',
+                    size_hint_y=None,
+                    height=dp(24),
+                )
+                self._lbl_sub = MDLabel(
+                    text=self.subtitle,
+                    bold=True,
+                    font_size='12sp',
+                    font_name='ArabicFont',
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 0.9),
+                    halign='left',
+                    shorten=True,
+                    shorten_from='right',
+                    size_hint_y=None,
+                    height=0,
+                    opacity=0,
+                )
+                center_box.add_widget(self._lbl_title)
+                center_box.add_widget(self._lbl_sub)
+                self.add_widget(center_box)
+
+                btn_right = MDCard(
+                    size_hint=(None, None),
+                    size=(dp(40), dp(40)),
+                    radius=[20],
+                    elevation=0,
+                    md_bg_color=(1, 1, 1, 0.18),
+                    line_color=(1, 1, 1, 0.25 if right_cb else 0.12),
+                    line_width=1,
+                    ripple_behavior=bool(right_cb),
+                    pos_hint={'center_y': 0.5},
+                )
+                if right_cb:
+                    btn_right.bind(on_release=right_cb)
+                right_fl = MDFloatLayout()
+                self._right_ico = MDIcon(
+                    icon=self.mode_icon,
+                    font_size='21sp',
+                    size_hint=(None, None),
+                    size=(dp(24), dp(24)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 1),
+                )
+                Clock.schedule_once(lambda dt, i=self._right_ico: setattr(i, 'font_size', '21sp'), 0)
+                right_fl.add_widget(self._right_ico)
+                btn_right.add_widget(right_fl)
+                self.add_widget(btn_right)
+
+                def _on_sub(inst, val):
+                    self._lbl_sub.text = val
+                    has_s = bool(str(val or '').strip())
+                    self._lbl_sub.height = dp(16) if has_s else 0
+                    self._lbl_sub.opacity = 1 if has_s else 0
+
+                self.bind(
+                    title=lambda inst, val: setattr(self._lbl_title, 'text', val),
+                    subtitle=_on_sub,
+                    mode_icon=lambda inst, val: setattr(self._right_ico, 'icon', val),
+                )
+
+        return _ModernHeaderBar(
+            back_cb=on_back,
+            right_cb=on_right,
+            title=title,
+            mode_icon=mode_icon,
+            md_bg_color=(0.09, 0.44, 0.84, 1),
+        )
+
+    def _on_prod_header_right_tap(self, instance=None):
+        if self.current_mode == 'transfer':
+            self.toggle_location()
+        elif self.current_mode == 'manage_products':
+            self.open_filter_menu(None)
+        else:
+            self.show_entity_selection_dialog(None)
+
     def _build_products_screen(self):
         screen = MDScreen(name='products')
+        screen.md_bg_color = (0.95, 0.96, 0.98, 1)
         root = MDBoxLayout(orientation='vertical')
         header = MDBoxLayout(orientation='vertical', adaptive_height=True, md_bg_color=(1, 1, 1, 1))
-        self.prod_toolbar = MDTopAppBar(title='Produits', left_action_items=[['arrow-left', lambda x: self.go_back()]], elevation=2)
+        self.prod_toolbar = self._create_modern_header(
+            'Produits',
+            on_back=lambda x: self.go_back(),
+            mode_icon='cart',
+            on_right=self._on_prod_header_right_tap,
+        )
         header.add_widget(self.prod_toolbar)
 
-        self.prod_search_layout = MDBoxLayout(orientation='horizontal', padding=[dp(10), dp(5), dp(10), 0], spacing=dp(5), size_hint_y=None, height=dp(55), md_bg_color=(1, 1, 1, 1))
-        self.search_field = SmartTextField(hint_text='Rechercher...', mode='rectangle', icon_right='magnify', size_hint_y=None, height=dp(40), pos_hint={'center_y': 0.5}, size_hint_x=1)
+        self.prod_search_layout = MDBoxLayout(
+            orientation='horizontal',
+            padding=[dp(12), dp(10), dp(12), dp(6)],
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(62),
+            md_bg_color=(1, 1, 1, 1),
+        )
+        search_card = MDCard(
+            orientation='horizontal',
+            size_hint_x=1,
+            size_hint_y=None,
+            height=dp(46),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.95, 0.96, 0.98, 1),
+            line_color=(0.86, 0.88, 0.93, 1),
+            line_width=1,
+            padding=[dp(12), 0, dp(8), 0],
+            spacing=dp(6),
+            pos_hint={'center_y': 0.5},
+        )
+        search_card.add_widget(
+            MDIcon(
+                icon='magnify',
+                theme_text_color='Secondary',
+                font_size='20sp',
+                size_hint_x=None,
+                width=dp(22),
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        self.search_field = SmartTextField(
+            hint_text='Rechercher...',
+            mode='line',
+            line_color_normal=(0, 0, 0, 0),
+            line_color_focus=(0, 0, 0, 0),
+            pos_hint={'center_y': 0.5},
+        )
         self.search_field.bind(text=self.filter_products)
-        self.prod_search_layout.add_widget(self.search_field)
+        search_card.add_widget(self.search_field)
+        self.prod_search_layout.add_widget(search_card)
 
-        self.btn_scan_prod = MDIconButton(icon='barcode-scan', theme_text_color='Custom', text_color=(0.2, 0.2, 0.2, 1), pos_hint={'center_y': 0.5}, icon_size='28sp', on_release=self.open_barcode_scanner)
+        self.btn_scan_prod = MDIconButton(
+            icon='barcode-scan',
+            theme_text_color='Custom',
+            text_color=(0.15, 0.25, 0.4, 1),
+            md_bg_color=(0.93, 0.95, 0.98, 1),
+            pos_hint={'center_y': 0.5},
+            icon_size='24sp',
+            on_release=self.open_barcode_scanner,
+        )
         self.prod_search_layout.add_widget(self.btn_scan_prod)
-        self.btn_add_prod = MDIconButton(icon='plus-circle', theme_text_color='Custom', text_color=(0, 0.7, 0, 1), pos_hint={'center_y': 0.5}, icon_size='36sp', on_release=lambda x: self.show_manage_product_dialog(None))
+        self.btn_add_prod = MDIconButton(
+            icon='plus',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+            md_bg_color=(0.0, 0.65, 0.25, 1),
+            pos_hint={'center_y': 0.5},
+            icon_size='26sp',
+            on_release=lambda x: self.show_manage_product_dialog(None),
+        )
         self.prod_search_layout.add_widget(self.btn_add_prod)
         header.add_widget(self.prod_search_layout)
-        header.add_widget(MDBoxLayout(size_hint_y=None, height=dp(5)))
 
-        filter_box = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(50), padding=[dp(10), 0, dp(10), dp(5)])
-        family_card = MDCard(size_hint=(1, 1), radius=[5], md_bg_color=(0.96, 0.96, 0.96, 1), line_color=(0.6, 0.6, 0.6, 1), line_width=1, elevation=0, ripple_behavior=True, on_release=self.open_filter_menu)
-        card_c = MDBoxLayout(orientation='horizontal', padding=[dp(15), 0])
-        self.btn_main_family_filter = MDLabel(text=AppConstants.FAM_ALL, theme_text_color='Custom', text_color=(0.15, 0.15, 0.15, 1), font_style='Subtitle1', bold=True, halign='left', valign='center', font_name='ArabicFont')
+        filter_box = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(52), padding=[dp(12), 0, dp(12), dp(8)])
+        family_card = MDCard(
+            size_hint=(1, 1),
+            radius=[12],
+            md_bg_color=(0.95, 0.96, 0.98, 1),
+            line_color=(0.86, 0.88, 0.93, 1),
+            line_width=1,
+            elevation=0,
+            ripple_behavior=True,
+            on_release=self.open_filter_menu,
+        )
+        card_c = MDBoxLayout(orientation='horizontal', padding=[dp(12), 0, dp(10), 0], spacing=dp(8))
+        card_c.add_widget(
+            MDIcon(
+                icon='shape-outline',
+                theme_text_color='Primary',
+                font_size='19sp',
+                size_hint_x=None,
+                width=dp(22),
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        self.btn_main_family_filter = MDLabel(
+            text=AppConstants.FAM_ALL,
+            theme_text_color='Custom',
+            text_color=(0.15, 0.17, 0.22, 1),
+            font_style='Subtitle2',
+            bold=True,
+            halign='left',
+            valign='center',
+            font_name='ArabicFont',
+        )
         card_c.add_widget(self.btn_main_family_filter)
-        card_c.add_widget(MDIcon(icon='menu-down', pos_hint={'center_y': 0.5}, theme_text_color='Secondary'))
+        card_c.add_widget(
+            MDIcon(
+                icon='chevron-down',
+                pos_hint={'center_y': 0.5},
+                theme_text_color='Secondary',
+                size_hint_x=None,
+                width=dp(22),
+            )
+        )
         family_card.add_widget(card_c)
         filter_box.add_widget(family_card)
         header.add_widget(filter_box)
-        header.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.9, 1)))
+        header.add_widget(MDSeparator(height=dp(1), color=(0.89, 0.91, 0.94, 1)))
         root.add_widget(header)
 
         self.rv_products = ProductRecycleView()
         self.rv_products.size_hint_y = 1
         root.add_widget(self.rv_products)
 
-        self.cart_bar = MDCard(size_hint_y=None, height=dp(60), padding=[dp(15), dp(5)], md_bg_color=self.theme_cls.primary_color, radius=[15, 15, 0, 0], ripple_behavior=True, on_release=self.open_cart_screen, elevation=4)
-        cart_box = MDBoxLayout(orientation='horizontal')
-        self.lbl_cart_count = MDLabel(text='PANIER (0)', theme_text_color='Custom', text_color=(1, 1, 1, 1), bold=True, halign='left', size_hint_x=0.5, font_style='Subtitle1')
-        self.lbl_cart_total = MDLabel(text='0,00 DA', theme_text_color='Custom', text_color=(1, 1, 1, 1), bold=True, halign='right', font_style='H6', size_hint_x=0.5)
+        self.cart_bar = MDCard(
+            size_hint_y=None,
+            height=dp(60),
+            padding=[dp(16), dp(8)],
+            md_bg_color=(0.09, 0.44, 0.84, 1),
+            radius=[18, 18, 0, 0],
+            ripple_behavior=True,
+            on_release=self.open_cart_screen,
+            elevation=2,
+        )
+        cart_box = MDBoxLayout(orientation='horizontal', spacing=dp(10))
+        cart_box.add_widget(
+            MDIcon(
+                icon='cart-outline',
+                theme_text_color='Custom',
+                text_color=(1, 1, 1, 1),
+                font_size='23sp',
+                size_hint_x=None,
+                width=dp(25),
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        self.lbl_cart_count = MDLabel(
+            text='PANIER (0)',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+            bold=True,
+            halign='left',
+            valign='middle',
+            size_hint_x=0.48,
+            font_style='Subtitle1',
+        )
+        self.lbl_cart_total = MDLabel(
+            text='0,00 DA',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+            bold=True,
+            halign='right',
+            valign='middle',
+            font_style='H6',
+            size_hint_x=0.52,
+        )
         cart_box.add_widget(self.lbl_cart_count)
         cart_box.add_widget(self.lbl_cart_total)
+        cart_box.add_widget(
+            MDIcon(
+                icon='chevron-right',
+                theme_text_color='Custom',
+                text_color=(1, 1, 1, 0.9),
+                font_size='23sp',
+                size_hint_x=None,
+                width=dp(22),
+                pos_hint={'center_y': 0.5},
+            )
+        )
         self.cart_bar.add_widget(cart_box)
         root.add_widget(self.cart_bar)
         screen.add_widget(root)
@@ -4402,8 +5466,39 @@ class StockApp(MDApp):
         if hasattr(self, 'btn_main_family_filter'):
             self.btn_main_family_filter.text = AppConstants.FAM_ALL
 
+        mode_styles = {
+            'sale': ((0.06, 0.56, 0.24, 1), 'account-switch-outline'),
+            'purchase': ((0.88, 0.42, 0.0, 1), 'account-switch-outline'),
+            'invoice_sale': ((0.09, 0.44, 0.84, 1), 'account-switch-outline'),
+            'invoice_purchase': ((0.76, 0.14, 0.22, 1), 'account-switch-outline'),
+            'proforma': ((0.5, 0.12, 0.65, 1), 'account-switch-outline'),
+            'order_purchase': ((0.0, 0.5, 0.52, 1), 'account-switch-outline'),
+            'return_sale': ((0.82, 0.12, 0.12, 1), 'account-switch-outline'),
+            'return_purchase': ((0.0, 0.55, 0.55, 1), 'account-switch-outline'),
+            'stock_in': ((0.15, 0.38, 0.75, 1), 'account-switch-outline'),
+            'stock_out': ((0.48, 0.28, 0.12, 1), 'account-switch-outline'),
+            'transfer': ((0.5, 0.1, 0.58, 1), 'swap-horizontal'),
+            'manage_products': ((0.09, 0.44, 0.84, 1), 'shape-outline'),
+        }
+        hdr_col, hdr_ico = mode_styles.get(mode, ((0.09, 0.44, 0.84, 1), 'cart'))
+
         self.prod_toolbar.title = AppConstants.MODE_TITLES.get(mode, 'Produits')
+        self.prod_toolbar.md_bg_color = hdr_col
+        self.prod_toolbar.mode_icon = hdr_ico
+        if mode == 'manage_products':
+            self.prod_toolbar.subtitle = 'Catalogue & Stock'
+        elif mode == 'transfer':
+            src = AppConstants.LOC_LABELS[self.selected_location]
+            dst = AppConstants.LOC_LABELS[AppConstants.LOC_WAREHOUSE if self.selected_location == AppConstants.LOC_STORE else AppConstants.LOC_STORE]
+            self.prod_toolbar.subtitle = f'{src}  >>>  {dst}'
+        elif self.selected_entity:
+            ent_lbl = 'Fournisseur' if AppConstants.get_entity_type(mode) == AppConstants.ENTITY_SUPPLIER else 'Client'
+            self.prod_toolbar.subtitle = f"{ent_lbl} : {self.fix_text(self.selected_entity.get('name', ''))}"
+        else:
+            self.prod_toolbar.subtitle = ''
+
         self.theme_cls.primary_palette = AppConstants.MODE_COLORS.get(mode, 'Blue')
+        self.cart_bar.md_bg_color = hdr_col
 
         if mode == 'manage_products':
             if self.btn_add_prod not in self.prod_search_layout.children:
@@ -4443,26 +5538,95 @@ class StockApp(MDApp):
     def open_filter_menu(self, instance):
         families = self.db.get_families()
         full_list = [AppConstants.FAM_ALL] + [f for f in families if f != AppConstants.FAM_ALL]
-        content = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True)
-        scroll = MDScrollView(size_hint_y=None, height=dp(300))
-        lst = MDBoxLayout(orientation='vertical', adaptive_height=True)
+        current_fam = getattr(self, 'selected_family_filter', AppConstants.FAM_ALL)
+
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(380), Window.height * 0.65),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+        scroll = MDScrollView(size_hint_y=1)
+        lst = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(8), padding=[dp(2), dp(2)])
+
         for fam in full_list:
-            lst.add_widget(
-                MDFlatButton(
+            is_sel = fam == current_fam
+            card = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(48),
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.90, 0.95, 1, 1) if is_sel else (0.97, 0.98, 0.99, 1),
+                line_color=(0.1, 0.45, 0.85, 0.6) if is_sel else (0.89, 0.91, 0.94, 1),
+                line_width=1.2 if is_sel else 1,
+                padding=[dp(12), 0],
+                spacing=dp(10),
+                ripple_behavior=True,
+                on_release=lambda x, f=fam: self.apply_filter(f),
+            )
+            card.add_widget(
+                MDIcon(
+                    icon='shape-outline' if fam == AppConstants.FAM_ALL else 'tag-outline',
+                    theme_text_color='Custom',
+                    text_color=(0.1, 0.45, 0.85, 1) if is_sel else (0.45, 0.48, 0.55, 1),
+                    font_size='20sp',
+                    size_hint_x=None,
+                    width=dp(22),
+                    pos_hint={'center_y': 0.5},
+                )
+            )
+            card.add_widget(
+                MDLabel(
                     text=self.fix_text(fam),
                     font_name='ArabicFont',
                     theme_text_color='Custom',
-                    text_color=(0.2, 0.2, 0.2, 1),
-                    font_style='Subtitle1',
-                    size_hint_x=1,
-                    height=dp(48),
-                    on_release=lambda x, f=fam: self.apply_filter(f),
+                    text_color=(0.08, 0.35, 0.72, 1) if is_sel else (0.15, 0.17, 0.22, 1),
+                    font_style='Subtitle2',
+                    bold=True,
+                    halign='left',
+                    valign='middle',
+                    shorten=True,
                 )
             )
-            lst.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.9, 1)))
+            if is_sel:
+                card.add_widget(
+                    MDIcon(
+                        icon='check-circle',
+                        theme_text_color='Custom',
+                        text_color=(0.1, 0.45, 0.85, 1),
+                        font_size='20sp',
+                        size_hint_x=None,
+                        width=dp(22),
+                        pos_hint={'center_y': 0.5},
+                    )
+                )
+            lst.add_widget(card)
+
         scroll.add_widget(lst)
         content.add_widget(scroll)
-        self.filter_dialog = MDDialog(title='Filtrer par famille', type='custom', content_cls=content, size_hint=(0.85, None))
+
+        btn_close = MDCard(
+            size_hint=(1, None),
+            height=dp(44),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.filter_dialog.dismiss() if getattr(self, 'filter_dialog', None) else None,
+        )
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+        content.add_widget(btn_close)
+
+        self.filter_dialog = MDDialog(
+            title='Filtrer par famille',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.88, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.filter_dialog.open()
 
     def apply_filter(self, family_name: str):
@@ -4538,21 +5702,35 @@ class StockApp(MDApp):
 
                 icon_name = 'package-variant'
                 icon_col = [0, 0.6, 0.2, 1]
+                thumb_bg = [0.93, 0.96, 1, 1]
+                stock_col = [0.08, 0.45, 0.2, 1]
+                stock_bg = [0.91, 0.97, 0.92, 1]
+
                 if is_virt:
                     price_fmt = 'Prix Libre'
                     price_col = [0, 0.4, 0.8, 1]
                     icon_name = 'pencil-plus'
                     icon_col = [0, 0.4, 0.8, 1]
+                    thumb_bg = [0.91, 0.95, 1, 1]
                     stock_txt = 'Illimité'
+                    stock_col = [0.08, 0.42, 0.78, 1]
+                    stock_bg = [0.91, 0.95, 1, 1]
                 elif is_qty_only:
                     price_fmt = f'Tot : {FinancialEngine.format_qty(s_store + s_wh)}'
                     price_col = [0.2, 0.2, 0.8, 1]
                     stock_txt = 'Illimité' if is_unlim else f'Mag : {FinancialEngine.format_qty(s_store)} | Dép : {FinancialEngine.format_qty(s_wh)}'
+                    stock_col = [0.2, 0.25, 0.32, 1]
+                    stock_bg = [0.94, 0.95, 0.97, 1]
                 elif is_purchase:
                     p_val = FinancialEngine.to_decimal(p.get('purchase_price', 0))
                     price_fmt = FinancialEngine.format_money(p_val)
                     price_col = [0.9, 0.5, 0, 1]
+                    thumb_bg = [1, 0.96, 0.9, 1]
+                    icon_col = [0.9, 0.5, 0, 1]
                     stock_txt = 'Illimité' if is_unlim else (f'Mag : {FinancialEngine.format_qty(s_store)} | Dép : {FinancialEngine.format_qty(s_wh)}' if s_wh != 0 else f'Qté : {FinancialEngine.format_qty(s_store)}')
+                    if not is_unlim and (s_store + s_wh) <= 0:
+                        stock_col = [0.8, 0.1, 0.1, 1]
+                        stock_bg = [1, 0.92, 0.92, 1]
                 else:
                     disp_price, has_promo = self._compute_product_sale_price(p, check_promo=show_promo, today_date=today_d)
                     price_fmt = FinancialEngine.format_money(disp_price)
@@ -4560,17 +5738,24 @@ class StockApp(MDApp):
                         price_col = [0, 0.2, 0.8, 1]
                         icon_name = 'sale'
                         icon_col = [0.9, 0.1, 0.1, 1]
+                        thumb_bg = [1, 0.92, 0.92, 1]
                     else:
                         price_col = [0, 0.6, 0.2, 1]
                     if is_unlim:
                         stock_txt = 'Illimité'
+                        stock_col = [0.08, 0.42, 0.78, 1]
+                        stock_bg = [0.91, 0.95, 1, 1]
                     elif s_wh != 0:
                         stock_txt = f'Qté : {FinancialEngine.format_qty(s_store)} | Dép : {FinancialEngine.format_qty(s_wh)}'
                     else:
                         stock_txt = f'Qté : {FinancialEngine.format_qty(s_store)}'
-                    if not has_promo and not is_unlim and (s_store + s_wh) <= 0:
-                        icon_name = 'package-variant-closed'
-                        icon_col = [0.8, 0, 0, 1]
+                    if not is_unlim and (s_store + s_wh) <= 0:
+                        stock_col = [0.8, 0.1, 0.1, 1]
+                        stock_bg = [1, 0.92, 0.92, 1]
+                        if not has_promo:
+                            icon_name = 'package-variant-closed'
+                            icon_col = [0.8, 0, 0, 1]
+                            thumb_bg = [1, 0.93, 0.93, 1]
 
                 rv_data.append({
                     'text_name': self.fix_text(p.get('name', '')),
@@ -4579,6 +5764,9 @@ class StockApp(MDApp):
                     'icon_name': icon_name,
                     'icon_color': icon_col,
                     'price_color': price_col,
+                    'stock_color': stock_col,
+                    'stock_bg': stock_bg,
+                    'thumb_bg': thumb_bg,
                     'image_path': final_img,
                     'raw_data': p,
                 })
@@ -4882,57 +6070,64 @@ class StockApp(MDApp):
         val_p1 = _fmt_p(product.get('price', 0)) if is_edit else ''
         val_p2 = _fmt_p(product.get('price_semi', 0)) if is_edit else ''
         val_p3 = _fmt_p(product.get('price_wholesale', 0)) if is_edit else ''
-        val_tva = _fmt_p(product.get('tva', 0)) if is_edit else ''
 
         val_is_promo = bool(int(product.get('is_promo_active', 0) or 0) == 1) if is_edit else False
         self.promo_type_selected = product.get('promo_type', 'fixed') if is_edit else 'fixed'
         val_promo_val = _fmt_p(product.get('promo_value', 0)) if is_edit else ''
         val_promo_exp = str(product.get('promo_expiry', '') or '') if is_edit else ''
 
-        scroll = MDScrollView(size_hint_y=None, height=dp(600))
-        main_box = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(14), padding=[dp(10), dp(10), dp(10), dp(20)])
+        scroll = MDScrollView(size_hint_y=None, height=min(dp(600), Window.height * 0.72))
+        main_box = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(15), padding=[dp(10), dp(10), dp(10), dp(20)])
 
-        card_info = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(0.98, 0.98, 0.98, 1))
-        card_info.add_widget(MDLabel(text='Informations Produit', bold=True, theme_text_color='Primary', font_style='Subtitle1'))
-        self.field_num = MDTextField(text=val_num, hint_text='N° Produit', icon_right='pound')
+        card_info = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(1, 1, 1, 1))
+        self.field_num = MDTextField(text=val_num, hint_text='N° Produit', size_hint_x=1, icon_right='pound')
         card_info.add_widget(self.field_num)
 
         box_bar = MDBoxLayout(orientation='horizontal', spacing=dp(5), adaptive_height=True)
         self.field_bar = MDTextField(text=val_barcode, hint_text='Code-Barres', size_hint_x=1, icon_right='barcode')
         box_bar.add_widget(self.field_bar)
         box_bar.add_widget(MDIconButton(icon='barcode-scan', on_release=lambda x: [setattr(self, 'target_scan_field', self.field_bar), self.open_barcode_scanner(None)]))
-        box_bar.add_widget(MDIconButton(icon='refresh', theme_text_color='Custom', text_color=self.theme_cls.primary_color, on_release=lambda x: setattr(self.field_bar, 'text', self._generate_ean13())))
+        box_bar.add_widget(MDIconButton(icon='refresh', on_release=lambda x: setattr(self.field_bar, 'text', self._generate_ean13())))
         card_info.add_widget(box_bar)
 
         self.field_name = SmartTextField(text=val_name, hint_text='Désignation *', required=True, icon_right='tag-text-outline')
-        self.field_reference = SmartTextField(text=val_ref, hint_text='Référence', icon_right='text')
+        self.field_reference = SmartTextField(text=val_ref, hint_text='Référence (Description)', icon_right='text')
         card_info.add_widget(self.field_name)
         card_info.add_widget(self.field_reference)
 
         card_info.add_widget(MDLabel(text='Famille :', font_style='Caption', theme_text_color='Secondary'))
-        fam_card = MDCard(size_hint_y=None, height=dp(48), radius=[6], md_bg_color=(0.95, 0.95, 0.95, 1), elevation=0)
+        fam_card = MDCard(size_hint_y=None, height=dp(42), radius=[4], md_bg_color=(0.95, 0.95, 0.95, 1), elevation=0)
         fam_float = MDFloatLayout()
-        self.btn_select_family = MDFlatButton(text=self.fix_text(self.selected_product_family_raw), font_name='ArabicFont', size_hint=(1, 1), pos_hint={'center_x': 0.5, 'center_y': 0.5}, on_release=lambda x: self.open_family_selector_dialog())
+        self.btn_select_family = MDFlatButton(
+            text=self.fix_text(self.selected_product_family_raw),
+            font_name='ArabicFont',
+            theme_text_color='Custom',
+            text_color=(0.1, 0.1, 0.1, 1),
+            size_hint=(1, 1),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            on_release=lambda x: self.open_family_selector_dialog(),
+        )
         fam_float.add_widget(self.btn_select_family)
         fam_float.add_widget(MDIconButton(icon='plus-circle', theme_text_color='Custom', text_color=(0, 0.65, 0.2, 1), pos_hint={'right': 1, 'center_y': 0.5}, on_release=lambda x: self.show_add_family_dialog()))
         fam_card.add_widget(fam_float)
         card_info.add_widget(fam_card)
 
-        img_status = os.path.basename(current_image) if (current_image and os.path.exists(current_image)) else 'Aucune'
-        box_img = MDBoxLayout(orientation='horizontal', spacing=dp(8), adaptive_height=True, padding=[0, dp(6), 0, 0])
-        self.lbl_image_status = MDLabel(text=f'Image : {img_status}', font_style='Caption', size_hint_x=0.5, theme_text_color='Secondary', shorten=True)
+        img_status = os.path.basename(current_image) if (current_image and os.path.exists(current_image)) else 'Aucune image'
+        img_color = (0, 0.6, 0, 1) if (current_image and os.path.exists(current_image)) else (0.5, 0.5, 0.5, 1)
+        box_img = MDBoxLayout(orientation='horizontal', spacing=dp(8), adaptive_height=True, padding=[0, dp(8), 0, 0])
+        box_img.add_widget(MDIcon(icon='image', theme_text_color='Custom', text_color=img_color, pos_hint={'center_y': 0.5}))
+        self.lbl_image_status = MDLabel(text=f'Image : {img_status}', font_style='Caption', size_hint_x=0.5, theme_text_color='Custom', text_color=img_color, shorten=True, pos_hint={'center_y': 0.5})
         box_img.add_widget(self.lbl_image_status)
-        box_img.add_widget(MDIconButton(icon='trash-can-outline', theme_text_color='Custom', text_color=(0.8, 0, 0, 1), on_release=lambda x: [setattr(self, 'temp_selected_image_path', None), setattr(self, 'remove_image_order', True), setattr(self.lbl_image_status, 'text', 'Image : Aucune')]))
-        box_img.add_widget(MDRaisedButton(text='Choisir', size_hint_x=0.3, md_bg_color=(0.2, 0.5, 0.8, 1), on_release=self.open_image_selector))
+        box_img.add_widget(MDIconButton(icon='trash-can-outline', theme_text_color='Custom', text_color=(0.8, 0, 0, 1), pos_hint={'center_y': 0.5}, on_release=lambda x: [setattr(self, 'temp_selected_image_path', None), setattr(self, 'remove_image_order', True), setattr(self.lbl_image_status, 'text', 'Image : Aucune image'), setattr(self.lbl_image_status, 'text_color', (0.5, 0.5, 0.5, 1))]))
+        box_img.add_widget(MDRaisedButton(text='Choisir', size_hint_x=0.3, md_bg_color=(0.2, 0.5, 0.8, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), pos_hint={'center_y': 0.5}, on_release=self.open_image_selector))
         card_info.add_widget(box_img)
         main_box.add_widget(card_info)
 
-        card_stock = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(0.96, 0.99, 0.96, 1))
-        card_stock.add_widget(MDLabel(text='Stock Initial (Magasin)', bold=True, theme_text_color='Primary', font_style='Subtitle1'))
-        row_stock = MDBoxLayout(orientation='horizontal', spacing=dp(10), adaptive_height=True)
-        self.chk_unlimited = MDCheckbox(active=is_unlimited, size_hint=(None, None), size=(dp(40), dp(40)))
-        lbl_unlim = MDLabel(text='Illimité\n(Verrouillé)' if has_movements else 'Illimité', font_style='Body2', size_hint_x=0.45)
-        self.field_stock = MDTextField(text=val_stock, hint_text='Quantité', input_filter='float', size_hint_x=0.55)
+        card_stock = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(1, 1, 1, 1))
+        row_stock = MDBoxLayout(orientation='horizontal', spacing=dp(15), adaptive_height=True)
+        self.chk_unlimited = MDCheckbox(active=is_unlimited, size_hint=(None, None), size=(dp(40), dp(40)), pos_hint={'center_y': 0.5})
+        lbl_unlim = MDLabel(text='Illimité\n(Verrouillé)' if has_movements else 'Illimité', bold=True, pos_hint={'center_y': 0.5})
+        self.field_stock = MDTextField(text=val_stock, hint_text='Quantité', input_filter='float', size_hint_x=0.5)
         if has_movements:
             self.chk_unlimited.disabled = True
             self.field_stock.disabled = True
@@ -4947,22 +6142,26 @@ class StockApp(MDApp):
         card_stock.add_widget(row_stock)
         main_box.add_widget(card_stock)
 
-        card_price = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(0.96, 0.96, 0.99, 1))
-        card_price.add_widget(MDLabel(text='Tarification (DA)', bold=True, theme_text_color='Primary', font_style='Subtitle1'))
-        self.field_cost = MDTextField(text=val_cost, hint_text="Prix d'Achat (Coût / PMP)", input_filter='float')
+        card_cost = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(8), elevation=1, adaptive_height=True, md_bg_color=(1, 0.96, 0.96, 1))
+        card_cost.add_widget(MDLabel(text="Prix d'achat (Coût / PMP)", font_style='Caption', bold=True, theme_text_color='Custom', text_color=(0.85, 0.2, 0.2, 1)))
+        self.field_cost = MDTextField(text=val_cost, hint_text="Prix d'achat", input_filter='float', text_color_normal=(0.85, 0.1, 0.1, 1), text_color_focus=(0.85, 0.1, 0.1, 1))
         if has_movements:
             self.field_cost.readonly = True
             self.field_cost.helper_text = 'PMP calculé automatiquement'
             self.field_cost.helper_text_mode = 'persistent'
-        self.field_p1 = MDTextField(text=val_p1, hint_text='Prix Détail', input_filter='float')
-        self.field_p2 = MDTextField(text=val_p2, hint_text='Prix Demi-Gros', input_filter='float')
-        self.field_p3 = MDTextField(text=val_p3, hint_text='Prix Gros', input_filter='float')
-        self.field_tva = MDTextField(text=val_tva, hint_text='TVA % (Factures)', input_filter='float')
-        for w in (self.field_cost, self.field_p1, self.field_p2, self.field_p3, self.field_tva):
-            card_price.add_widget(w)
-        main_box.add_widget(card_price)
+        card_cost.add_widget(self.field_cost)
+        main_box.add_widget(card_cost)
 
-        card_promo = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(1, 0.95, 0.95, 1))
+        card_selling = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(0.96, 0.99, 0.96, 1))
+        card_selling.add_widget(MDLabel(text='Prix de vente', font_style='Caption', bold=True, theme_text_color='Custom', text_color=(0.1, 0.6, 0.2, 1)))
+        self.field_p1 = MDTextField(text=val_p1, hint_text='Prix Détail (Client)', input_filter='float', text_color_normal=(0, 0.55, 0.15, 1), text_color_focus=(0, 0.7, 0.2, 1))
+        self.field_p2 = MDTextField(text=val_p2, hint_text='Prix Demi-Gros', input_filter='float', text_color_normal=(0, 0.55, 0.15, 1), text_color_focus=(0, 0.7, 0.2, 1))
+        self.field_p3 = MDTextField(text=val_p3, hint_text='Prix Gros', input_filter='float', text_color_normal=(0, 0.55, 0.15, 1), text_color_focus=(0, 0.7, 0.2, 1))
+        for w in (self.field_p1, self.field_p2, self.field_p3):
+            card_selling.add_widget(w)
+        main_box.add_widget(card_selling)
+
+        card_promo = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(0.94, 0.91, 1, 1))
         h_promo = MDBoxLayout(orientation='horizontal', spacing=dp(10), adaptive_height=True)
         h_promo.add_widget(MDIcon(icon='sale', theme_text_color='Custom', text_color=(0.8, 0, 0, 1)))
         h_promo.add_widget(MDLabel(text='Promotion', bold=True, theme_text_color='Custom', text_color=(0.8, 0, 0, 1)))
@@ -4971,8 +6170,8 @@ class StockApp(MDApp):
         card_promo.add_widget(h_promo)
 
         type_box = MDBoxLayout(orientation='horizontal', spacing=dp(10), adaptive_height=True)
-        self.btn_promo_fixed = MDRaisedButton(text='Prix Fixe', size_hint_x=0.5, elevation=0)
-        self.btn_promo_percent = MDRaisedButton(text='Pourcentage %', size_hint_x=0.5, elevation=0)
+        self.btn_promo_fixed = MDRaisedButton(text='Prix Fixe', size_hint_x=0.5, elevation=0, theme_text_color='Custom')
+        self.btn_promo_percent = MDRaisedButton(text='Pourcentage %', size_hint_x=0.5, elevation=0, theme_text_color='Custom')
         self.field_promo_val = MDTextField(text=val_promo_val, hint_text='Valeur', input_filter='float')
 
         def _upd_promo_btns():
@@ -4991,7 +6190,7 @@ class StockApp(MDApp):
         card_promo.add_widget(self.field_promo_val)
 
         box_date = MDBoxLayout(orientation='horizontal', spacing=dp(5), adaptive_height=True)
-        self.btn_promo_date = MDRaisedButton(text=val_promo_exp if val_promo_exp else 'Date Fin (Optionnel)', md_bg_color=(0.3, 0.3, 0.3, 1), size_hint_x=0.85)
+        self.btn_promo_date = MDRaisedButton(text=val_promo_exp if val_promo_exp else 'Date Fin (Optionnel)', md_bg_color=(0.3, 0.3, 0.3, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), size_hint_x=0.85)
 
         def _open_promo_picker(x):
             dp_dlg = MDDatePicker()
@@ -5040,7 +6239,7 @@ class StockApp(MDApp):
                     'price': FinancialEngine.to_decimal(self.field_p1.text or '0'),
                     'price_semi': FinancialEngine.to_decimal(self.field_p2.text or '0'),
                     'price_wholesale': FinancialEngine.to_decimal(self.field_p3.text or '0'),
-                    'tva': FinancialEngine.to_decimal(self.field_tva.text or '0'),
+                    'tva': FinancialEngine.to_decimal(product.get('tva', 0)) if is_edit else Decimal('0'),
                     'image_path': final_img,
                     'is_promo_active': self.chk_promo_active.active,
                     'promo_type': self.promo_type_selected,
@@ -5088,22 +6287,28 @@ class StockApp(MDApp):
                 text='Voulez-vous vraiment supprimer ce produit ?',
                 buttons=[
                     MDFlatButton(text='NON', on_release=lambda z: self.conf_diag.dismiss()),
-                    MDRaisedButton(text='OUI, SUPPRIMER', md_bg_color=(0.8, 0, 0, 1), on_release=_confirm),
+                    MDRaisedButton(text='OUI, SUPPRIMER', md_bg_color=(0.8, 0, 0, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=_confirm),
                 ],
             )
             self.conf_diag.open()
 
-        footer = MDBoxLayout(orientation='vertical', spacing=dp(10), adaptive_height=True, padding=[0, dp(16), 0, 0])
-        footer.add_widget(MDRaisedButton(text='ENREGISTRER', md_bg_color=(0, 0.7, 0.2, 1), text_color=(1, 1, 1, 1), size_hint_x=1, height=dp(50), on_release=_save_product))
+        footer = MDBoxLayout(orientation='vertical', spacing=dp(10), adaptive_height=True, padding=[0, dp(20), 0, 0])
+        footer.add_widget(MDRaisedButton(text='ENREGISTRER', md_bg_color=(0, 0.7, 0, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), size_hint_x=1, height=dp(48), on_release=_save_product))
         if is_edit:
-            footer.add_widget(MDRaisedButton(text='SUPPRIMER', md_bg_color=(0.8, 0, 0, 1), text_color=(1, 1, 1, 1), size_hint_x=1, height=dp(50), on_release=_delete_product))
-        footer.add_widget(MDRaisedButton(text='FERMER', md_bg_color=(0.9, 0.9, 0.9, 1), text_color=(0.2, 0.2, 0.2, 1), size_hint_x=1, height=dp(50), on_release=lambda x: self.dialog.dismiss()))
+            footer.add_widget(MDRaisedButton(text='SUPPRIMER', md_bg_color=(0.8, 0, 0, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), size_hint_x=1, height=dp(48), on_release=_delete_product))
+        footer.add_widget(MDRaisedButton(text='FERMER', md_bg_color=(0.9, 0.9, 0.9, 1), theme_text_color='Custom', text_color=(0.2, 0.2, 0.2, 1), size_hint_x=1, height=dp(48), on_release=lambda x: self.dialog.dismiss()))
         main_box.add_widget(footer)
         scroll.add_widget(main_box)
 
-        self.dialog = MDDialog(title='Fiche Produit' if is_edit else 'Nouveau Produit', type='custom', content_cls=scroll, buttons=[], size_hint=(0.95, 0.88))
+        self.dialog = MDDialog(
+            title='Fiche Produit' if is_edit else 'Nouveau Produit',
+            type='custom',
+            content_cls=scroll,
+            buttons=[],
+            size_hint=(0.95, 0.9),
+        )
         self.dialog.open()
-        Clock.schedule_once(lambda dt: setattr(self.field_name, 'focus', True), 0.3)
+        Clock.schedule_once(lambda dt: setattr(self.field_name, 'focus', True), 0.5)
 
     # --------------------------------------------------------------------------
     # 7.5 CONTRÔLE DE STOCK, PANIER & RÈGLES MÉTIER DESKTOP
@@ -5112,7 +6317,7 @@ class StockApp(MDApp):
         doc_type = AppConstants.get_doc_type_for_mode(self.current_mode)
         if doc_type == AppConstants.DOC_TR:
             return True
-        if self.db.get_bool_setting('allow_negative_stock', default=False):
+        if self.db.get_bool_setting('allow_negative_stock', default=True):
             return False
         return AppConstants.STOCK_MOVEMENTS.get(doc_type, 0) == -1
 
@@ -5163,11 +6368,156 @@ class StockApp(MDApp):
                 self.stock_error_dialog.dismiss()
             except Exception:
                 pass
+
+        raw_msg = str(message or '').strip()
+        main_msg = raw_msg
+        avail_val = None
+        req_val = None
+
+        lines = [ln.strip() for ln in raw_msg.split('\n') if ln.strip()]
+        if len(lines) >= 2 and 'Disponible' in lines[-1] and '|' in lines[-1] and 'Demandé' in lines[-1]:
+            try:
+                left_p, right_p = lines[-1].split('|', 1)
+                avail_val = left_p.split(':', 1)[1].strip()
+                req_val = right_p.split(':', 1)[1].strip()
+                main_msg = '\n'.join(lines[:-1])
+            except Exception:
+                avail_val = None
+                req_val = None
+
+        content = MDBoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            adaptive_height=True,
+            spacing=dp(12),
+            padding=[0, 0, 0, dp(2)],
+        )
+
+        badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(56)),
+            radius=[28],
+            elevation=0,
+            md_bg_color=(1, 0.92, 0.92, 1),
+            pos_hint={'center_x': 0.5},
+        )
+        b_fl = MDFloatLayout()
+        b_fl.add_widget(
+            MDIcon(
+                icon='package-variant-closed-remove',
+                theme_text_color='Custom',
+                text_color=(0.82, 0.12, 0.12, 1),
+                font_size='28sp',
+                size_hint=(None, None),
+                size=(dp(30), dp(30)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        badge.add_widget(b_fl)
+        content.add_widget(badge)
+
+        content.add_widget(
+            MDLabel(
+                text='Stock Insuffisant',
+                halign='center',
+                font_style='H6',
+                bold=True,
+                theme_text_color='Custom',
+                text_color=(0.78, 0.12, 0.12, 1),
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+
+        msg_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(1, 0.95, 0.95, 1),
+            line_color=(0.94, 0.78, 0.78, 1),
+            line_width=1,
+            padding=[dp(14), dp(10)],
+        )
+        lbl_msg = MDLabel(
+            text=main_msg,
+            halign='center',
+            font_style='Body2',
+            bold=True,
+            font_name='ArabicFont',
+            theme_text_color='Custom',
+            text_color=(0.25, 0.14, 0.14, 1),
+            size_hint_y=None,
+        )
+        lbl_msg.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(22), val[1])),
+        )
+        msg_card.add_widget(lbl_msg)
+        content.add_widget(msg_card)
+
+        if avail_val is not None and req_val is not None:
+            kpi_row = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(62))
+
+            c_avail = MDCard(
+                orientation='vertical',
+                size_hint_x=0.5,
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.96, 0.97, 0.99, 1),
+                line_color=(0.86, 0.88, 0.93, 1),
+                line_width=1,
+                padding=[dp(8), dp(6)],
+                spacing=dp(2),
+            )
+            c_avail.add_widget(MDLabel(text='DISPONIBLE', halign='center', font_style='Caption', bold=True, theme_text_color='Secondary', size_hint_y=None, height=dp(16)))
+            c_avail.add_widget(MDLabel(text=avail_val, halign='center', valign='middle', font_style='H6', bold=True, theme_text_color='Custom', text_color=(0.82, 0.12, 0.12, 1)))
+
+            c_req = MDCard(
+                orientation='vertical',
+                size_hint_x=0.5,
+                radius=[12],
+                elevation=0,
+                md_bg_color=(1, 0.96, 0.90, 1),
+                line_color=(0.94, 0.80, 0.62, 1),
+                line_width=1,
+                padding=[dp(8), dp(6)],
+                spacing=dp(2),
+            )
+            c_req.add_widget(MDLabel(text='DEMANDÉ', halign='center', font_style='Caption', bold=True, theme_text_color='Custom', text_color=(0.75, 0.38, 0, 1), size_hint_y=None, height=dp(16)))
+            c_req.add_widget(MDLabel(text=req_val, halign='center', valign='middle', font_style='H6', bold=True, theme_text_color='Custom', text_color=(0.85, 0.42, 0, 1)))
+
+            kpi_row.add_widget(c_avail)
+            kpi_row.add_widget(c_req)
+            content.add_widget(kpi_row)
+
+        btn_ok = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(48),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.82, 0.12, 0.12, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=lambda x: self.stock_error_dialog.dismiss(),
+        )
+        btn_ok.add_widget(MDBoxLayout())
+        btn_ok.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDLabel(text='COMPRIS', bold=True, font_size='15sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDBoxLayout())
+        content.add_widget(btn_ok)
+
         self.stock_error_dialog = MDDialog(
-            title='Stock Insuffisant',
-            text=message,
-            buttons=[MDRaisedButton(text='COMPRIS', md_bg_color=(0.8, 0, 0, 1), text_color=(1, 1, 1, 1), on_release=lambda x: self.stock_error_dialog.dismiss())],
-            size_hint=(0.88, None),
+            title='',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.90, None),
+            radius=[20, 20, 20, 20],
+            buttons=[],
         )
         self.stock_error_dialog.open()
 
@@ -5193,106 +6543,260 @@ class StockApp(MDApp):
         self.input_reset_mode = True
 
         def _upd_colors():
-            act, inact = (0.9, 1, 0.9, 1), (0.95, 0.95, 0.95, 1)
+            act_bg, act_border = (0.93, 0.99, 0.95, 1), (0.05, 0.62, 0.28, 1)
+            inact_bg, inact_border = (0.96, 0.97, 0.98, 1), (0.86, 0.88, 0.93, 1)
             if hasattr(self, 'qty_card'):
-                self.qty_card.md_bg_color = act if self.active_input_target == 'qty' else inact
-                self.qty_card.elevation = 3 if self.active_input_target == 'qty' else 0
+                is_q = self.active_input_target == 'qty'
+                self.qty_card.md_bg_color = act_bg if is_q else inact_bg
+                self.qty_card.line_color = act_border if is_q else inact_border
+                self.qty_card.line_width = 1.4 if is_q else 1.0
             if hasattr(self, 'price_card'):
-                self.price_card.md_bg_color = act if self.active_input_target == 'price' else inact
-                self.price_card.elevation = 3 if self.active_input_target == 'price' else 0
+                is_p = self.active_input_target == 'price'
+                self.price_card.md_bg_color = act_bg if is_p else inact_bg
+                self.price_card.line_color = act_border if is_p else inact_border
+                self.price_card.line_width = 1.4 if is_p else 1.0
 
-        header_box = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing='4dp')
-        header_box.add_widget(MDLabel(text=self.fix_text(product.get('name')), halign='center', bold=True, font_style='Subtitle1', theme_text_color='Primary', adaptive_height=True))
+        header_box = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True, spacing=dp(4))
+        lbl_title = MDLabel(
+            text=self.fix_text(product.get('name')),
+            halign='center',
+            bold=True,
+            font_style='Subtitle1',
+            font_size='16sp',
+            font_name='ArabicFont',
+            theme_text_color='Primary',
+            size_hint_y=None,
+            max_lines=2,
+        )
+        lbl_title.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(22), val[1])),
+        )
+        header_box.add_widget(lbl_title)
+
         if has_promo:
-            header_box.add_widget(MDLabel(text='PROMOTION ACTIVÉE', halign='center', theme_text_color='Custom', text_color=(0.85, 0, 0, 1), font_style='Caption', bold=True, adaptive_height=True))
+            header_box.add_widget(
+                MDLabel(
+                    text='PROMOTION ACTIVÉE',
+                    halign='center',
+                    theme_text_color='Custom',
+                    text_color=(0.85, 0.1, 0.1, 1),
+                    font_style='Caption',
+                    bold=True,
+                    size_hint_y=None,
+                    height=dp(18),
+                )
+            )
         elif price_found_in_history:
-            header_box.add_widget(MDLabel(text='Dernier Prix Appliqué (Historique)', halign='center', theme_text_color='Custom', text_color=(0, 0.45, 0.75, 1), font_style='Caption', bold=True, adaptive_height=True))
+            header_box.add_widget(
+                MDLabel(
+                    text='Dernier Prix Appliqué (Historique)',
+                    halign='center',
+                    theme_text_color='Custom',
+                    text_color=(0, 0.45, 0.78, 1),
+                    font_style='Caption',
+                    bold=True,
+                    size_hint_y=None,
+                    height=dp(18),
+                )
+            )
 
-        content = MDBoxLayout(orientation='vertical', spacing='8dp', size_hint_y=None, height=dp(410 if is_qty_only else 500), padding=[0, '5dp', 0, 0])
+        target_h = min(dp(430 if is_qty_only else 510), Window.height * (0.72 if is_qty_only else 0.82))
+        content = MDBoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, height=target_h, padding=[0, 0, 0, dp(2)])
         content.add_widget(header_box)
 
         if not is_qty_only:
-            self.price_card = MDCard(size_hint_y=None, height='70dp', radius=[10], padding=[10, 0, 10, 0], elevation=0)
-            self.price_field = NoMenuTextField(
-                text=FinancialEngine.format_qty(curr_price),
-                hint_text='Dernier Prix (Historique)' if price_found_in_history else 'Prix Unitaire (DA)',
-                font_size='26sp',
-                halign='center',
-                mode='line',
-                readonly=True,
-                line_color_normal=(0, 0, 0, 0),
-                line_color_focus=(0, 0, 0, 0),
-                pos_hint={'center_y': 0.5},
+            def _select_price(*args):
+                if self.active_input_target != 'price':
+                    self.input_reset_mode = True
+                self.active_input_target = 'price'
+                _upd_colors()
+
+            self.price_card = MDCard(
+                orientation='vertical',
+                size_hint=(1, None),
+                height=dp(64),
+                radius=[12],
+                elevation=0,
+                padding=[dp(12), dp(6)],
+                spacing=dp(2),
+                ripple_behavior=True,
+                on_release=_select_price,
             )
-            self.price_field.theme_text_color = 'Custom'
-            price_txt_col = (0, 0.45, 0.75, 1) if price_found_in_history else (0, 0, 0, 1)
-            self.price_field.text_color_normal = price_txt_col
-            self.price_field.text_color_focus = price_txt_col
-
-            def _on_price_touch(inst, touch):
-                if inst.collide_point(*touch.pos):
-                    if self.active_input_target != 'price':
-                        self.input_reset_mode = True
-                    self.active_input_target = 'price'
-                    _upd_colors()
-                    return True
-                return False
-
-            self.price_field.bind(on_touch_down=_on_price_touch)
+            self.price_card.add_widget(
+                MDLabel(
+                    text='Dernier Prix (Historique)' if price_found_in_history else 'Prix Unitaire (DA)',
+                    font_style='Caption',
+                    bold=True,
+                    halign='center',
+                    theme_text_color='Custom',
+                    text_color=(0, 0.45, 0.78, 1) if price_found_in_history else (0.45, 0.48, 0.54, 1),
+                    size_hint_y=None,
+                    height=dp(16),
+                )
+            )
+            self.price_field = MDLabel(
+                text=FinancialEngine.format_qty(curr_price),
+                font_size='24sp',
+                bold=True,
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0, 0.45, 0.78, 1) if price_found_in_history else (0.1, 0.12, 0.16, 1),
+            )
             self.price_card.add_widget(self.price_field)
-            p_row = MDBoxLayout(size_hint_y=None, height='75dp', padding=[60, 0, 60, 0])
-            p_row.add_widget(self.price_card)
-            content.add_widget(p_row)
+            content.add_widget(self.price_card)
         elif hasattr(self, 'price_field'):
             del self.price_field
             if hasattr(self, 'price_card'):
                 del self.price_card
 
-        qty_row = MDBoxLayout(orientation='horizontal', spacing='10dp', size_hint_y=None, height='65dp', padding=[40, 0])
-        btn_minus = MDIconButton(icon='minus', theme_text_color='Custom', text_color=(1, 1, 1, 1), md_bg_color=(0.9, 0.3, 0.3, 1), pos_hint={'center_y': 0.5})
-        self.qty_card = MDCard(size_hint_x=1, size_hint_y=None, height='60dp', radius=[10], padding=[10, 0, 10, 0], elevation=0, pos_hint={'center_y': 0.5})
-        self.qty_field = NoMenuTextField(
-            text='1',
-            hint_text='Qté',
-            font_size='28sp',
-            halign='center',
-            readonly=True,
-            mode='line',
-            line_color_normal=(0, 0, 0, 0),
-            line_color_focus=(0, 0, 0, 0),
-            pos_hint={'center_y': 0.5},
+        def _select_qty(*args):
+            if self.active_input_target != 'qty':
+                self.input_reset_mode = True
+            self.active_input_target = 'qty'
+            _upd_colors()
+
+        qty_row = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(58))
+        btn_minus = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(58)),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(1, 0.93, 0.93, 1),
+            line_color=(0.94, 0.74, 0.74, 1),
+            line_width=1,
+            ripple_behavior=True,
         )
-        self.qty_field.theme_text_color = 'Custom'
-        self.qty_field.text_color_normal = (0, 0, 0, 1)
-        self.qty_field.text_color_focus = (0, 0, 0, 1)
+        m_fl = MDFloatLayout()
+        m_fl.add_widget(
+            MDIcon(
+                icon='minus',
+                theme_text_color='Custom',
+                text_color=(0.82, 0.12, 0.12, 1),
+                font_size='24sp',
+                size_hint=(None, None),
+                size=(dp(26), dp(26)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        btn_minus.add_widget(m_fl)
 
-        def _on_qty_touch(inst, touch):
-            if inst.collide_point(*touch.pos):
-                if self.active_input_target != 'qty':
-                    self.input_reset_mode = True
-                self.active_input_target = 'qty'
-                _upd_colors()
-                return True
-            return False
-
-        self.qty_field.bind(on_touch_down=_on_qty_touch)
+        self.qty_card = MDCard(
+            orientation='vertical',
+            size_hint_x=1,
+            size_hint_y=None,
+            height=dp(58),
+            radius=[12],
+            elevation=0,
+            padding=[dp(10), dp(4)],
+            spacing=dp(1),
+            ripple_behavior=True,
+            on_release=_select_qty,
+        )
+        self.qty_card.add_widget(
+            MDLabel(
+                text='Quantité',
+                font_style='Caption',
+                bold=True,
+                halign='center',
+                theme_text_color='Secondary',
+                size_hint_y=None,
+                height=dp(15),
+            )
+        )
+        self.qty_field = MDLabel(
+            text='1',
+            font_size='25sp',
+            bold=True,
+            halign='center',
+            valign='middle',
+            theme_text_color='Custom',
+            text_color=(0.1, 0.12, 0.16, 1),
+        )
         self.qty_card.add_widget(self.qty_field)
-        btn_plus = MDIconButton(icon='plus', theme_text_color='Custom', text_color=(1, 1, 1, 1), md_bg_color=(0.2, 0.7, 0.2, 1), pos_hint={'center_y': 0.5})
+
+        btn_plus = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(58)),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.90, 0.98, 0.92, 1),
+            line_color=(0.68, 0.88, 0.74, 1),
+            line_width=1,
+            ripple_behavior=True,
+        )
+        p_fl = MDFloatLayout()
+        p_fl.add_widget(
+            MDIcon(
+                icon='plus',
+                theme_text_color='Custom',
+                text_color=(0.04, 0.58, 0.22, 1),
+                font_size='24sp',
+                size_hint=(None, None),
+                size=(dp(26), dp(26)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        btn_plus.add_widget(p_fl)
+
         qty_row.add_widget(btn_minus)
         qty_row.add_widget(self.qty_card)
         qty_row.add_widget(btn_plus)
         content.add_widget(qty_row)
 
-        self.btn_add = MDRaisedButton(text='AJOUTER', md_bg_color=(0, 0.7, 0.2, 1), text_color=(1, 1, 1, 1), size_hint_x=0.7, size_hint_y=1, font_size='18sp', elevation=3)
+        self.btn_add = MDCard(
+            orientation='vertical',
+            size_hint_x=0.65,
+            size_hint_y=None,
+            height=dp(52),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.04, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            padding=[dp(8), dp(4)],
+            spacing=dp(1),
+        )
+        lbl_add_main = MDLabel(
+            text='AJOUTER',
+            bold=True,
+            font_size='14.5sp',
+            halign='center',
+            valign='middle',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+        )
+        lbl_add_sub = MDLabel(
+            text='',
+            bold=True,
+            font_size='13sp',
+            halign='center',
+            valign='middle',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 0.92),
+            size_hint_y=None,
+            height=0,
+            opacity=0,
+        )
+        self.btn_add.add_widget(lbl_add_main)
+        self.btn_add.add_widget(lbl_add_sub)
 
         def _update_btn_txt():
             if is_qty_only:
-                self.btn_add.text = 'AJOUTER'
+                lbl_add_sub.text = ''
+                lbl_add_sub.height = 0
+                lbl_add_sub.opacity = 0
                 return
             q = FinancialEngine.to_decimal(self.qty_field.text or '0')
             p = FinancialEngine.to_decimal(self.price_field.text or '0')
             calc = FinancialEngine.calculate_document_totals([{'id': product['id'], 'qty': q, 'price': p, 'tva': product.get('tva', 0)}], doc_type=doc_type)
-            self.btn_add.text = f"AJOUTER\n{FinancialEngine.format_money(calc['final_total'])}"
+            lbl_add_sub.text = FinancialEngine.format_money(calc['final_total'])
+            lbl_add_sub.height = dp(18)
+            lbl_add_sub.opacity = 1
 
         def _confirm_add(x):
             q_val = FinancialEngine.to_decimal(self.qty_field.text or '0')
@@ -5309,9 +6813,14 @@ class StockApp(MDApp):
                         self.warn_cost_dlg.dismiss()
                         self._finalize_add_to_cart(product, q_val, p_val, doc_type)
 
+                    warn_txt = (
+                        f"Le prix de vente ({FinancialEngine.format_money(p_val)}) est inférieur au prix minimum autorisé.\n\nContinuer quand même ?"
+                        if self.is_seller_mode
+                        else f"Le prix de vente ({FinancialEngine.format_money(p_val)}) est inférieur au coût d'achat ({FinancialEngine.format_money(cost_val)}).\n\nContinuer quand même ?"
+                    )
                     self.warn_cost_dlg = MDDialog(
                         title='Attention : Prix bas',
-                        text=f"Le prix de vente ({FinancialEngine.format_money(p_val)}) est inférieur au coût d'achat ({FinancialEngine.format_money(cost_val)}).\n\nContinuer quand même ?",
+                        text=warn_txt,
                         buttons=[
                             MDFlatButton(text='ANNULER', on_release=lambda y: self.warn_cost_dlg.dismiss()),
                             MDRaisedButton(text='OUI, CONTINUER', md_bg_color=(0.9, 0.5, 0, 1), on_release=_proceed_low),
@@ -5358,23 +6867,94 @@ class StockApp(MDApp):
                 fld.text = fld.text[:-1]
             _update_btn_txt()
 
-        grid = MDGridLayout(cols=3, spacing='8dp', size_hint_y=1, padding=[20, 0])
+        grid = MDGridLayout(cols=3, spacing=dp(8), size_hint_y=1)
         for key in ('7', '8', '9', '4', '5', '6', '1', '2', '3', '.', '0', 'DEL'):
             if key == 'DEL':
-                grid.add_widget(MDIconButton(icon='backspace-outline', theme_text_color='Custom', text_color=(0, 0, 0, 1), md_bg_color=(0.8, 0.8, 0.8, 1), size_hint=(1, 1), on_release=_bkspc))
+                del_card = MDCard(
+                    md_bg_color=(1, 0.93, 0.93, 1),
+                    line_color=(0.94, 0.78, 0.78, 1),
+                    line_width=1,
+                    radius=[12],
+                    elevation=0,
+                    ripple_behavior=True,
+                    on_release=_bkspc,
+                )
+                d_fl = MDFloatLayout()
+                d_fl.add_widget(
+                    MDIcon(
+                        icon='backspace-outline',
+                        theme_text_color='Custom',
+                        text_color=(0.82, 0.14, 0.14, 1),
+                        font_size='22sp',
+                        size_hint=(None, None),
+                        size=(dp(24), dp(24)),
+                        halign='center',
+                        valign='middle',
+                        pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                    )
+                )
+                del_card.add_widget(d_fl)
+                grid.add_widget(del_card)
             else:
-                grid.add_widget(MDRaisedButton(text=key, md_bg_color=(0.95, 0.95, 0.95, 1), theme_text_color='Custom', text_color=(0, 0, 0, 1), font_size='22sp', size_hint=(1, 1), elevation=1, on_release=lambda x, k=key: _digit(k)))
+                key_card = MDCard(
+                    md_bg_color=(0.96, 0.97, 0.99, 1),
+                    line_color=(0.88, 0.90, 0.94, 1),
+                    line_width=1,
+                    radius=[12],
+                    elevation=0,
+                    ripple_behavior=True,
+                    on_release=lambda x, k=key: _digit(k),
+                )
+                key_card.add_widget(
+                    MDLabel(
+                        text=key,
+                        halign='center',
+                        valign='middle',
+                        font_size='21sp',
+                        bold=True,
+                        theme_text_color='Custom',
+                        text_color=(0.12, 0.14, 0.18, 1),
+                    )
+                )
+                grid.add_widget(key_card)
         content.add_widget(grid)
-        content.add_widget(MDLabel(text='', size_hint_y=None, height='8dp'))
 
-        btns = MDBoxLayout(orientation='horizontal', spacing='10dp', size_hint_y=None, height='60dp')
-        btns.add_widget(MDFlatButton(text='ANNULER', theme_text_color='Custom', text_color=(0.5, 0.5, 0.5, 1), size_hint_x=0.3, on_release=lambda x: self.dialog.dismiss()))
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(52))
+        btn_cancel = MDCard(
+            size_hint_x=0.35,
+            size_hint_y=None,
+            height=dp(52),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.dialog.dismiss(),
+        )
+        btn_cancel.add_widget(
+            MDLabel(
+                text='ANNULER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+        btns.add_widget(btn_cancel)
         btns.add_widget(self.btn_add)
         content.add_widget(btns)
 
         _upd_colors()
         _update_btn_txt()
-        self.dialog = MDDialog(title='', type='custom', content_cls=content, buttons=[], size_hint=(0.85, None))
+        self.dialog = MDDialog(
+            title='',
+            type='custom',
+            content_cls=content,
+            buttons=[],
+            size_hint=(0.90, None),
+            radius=[20, 20, 20, 20],
+        )
         self.dialog.open()
 
     def _finalize_add_to_cart(self, product: dict, qty: Decimal, price: Decimal, doc_type: str):
@@ -5462,39 +7042,286 @@ class StockApp(MDApp):
     # 7.6 ÉCRAN PANIER & ÉDITION DES LIGNES
     # --------------------------------------------------------------------------
     def _build_cart_screen(self):
-        screen = MDScreen(name='cart')
-        layout = MDBoxLayout(orientation='vertical')
-        self.cart_toolbar = MDTopAppBar(title='Panier', left_action_items=[['arrow-left', lambda x: self.back_to_products()]])
-        layout.add_widget(self.cart_toolbar)
+        class _PillSelectorCard(MDCard):
+            text = StringProperty('')
+            icon = StringProperty('')
 
-        selectors = MDCard(orientation='horizontal', size_hint_y=None, height=dp(70), padding=dp(10), radius=0, md_bg_color=(0.95, 0.95, 0.95, 1))
-        self.btn_ent_screen = MDFillRoundFlatButton(text='Client', size_hint_x=0.45, on_release=self.handle_entity_button_click)
-        self.btn_loc_screen = MDFillRoundFlatIconButton(text='Magasin', icon='store', size_hint_x=0.45, on_release=self.toggle_location)
-        selectors.add_widget(self.btn_ent_screen)
-        selectors.add_widget(MDBoxLayout(size_hint_x=0.1))
-        selectors.add_widget(self.btn_loc_screen)
-        layout.add_widget(selectors)
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.orientation = 'horizontal'
+                self.size_hint_y = None
+                self.height = dp(44)
+                self.radius = [12]
+                self.elevation = 0
+                self.ripple_behavior = True
+                self.padding = [dp(10), 0, dp(10), 0]
+                self.spacing = dp(6)
+
+                self._ico = MDIcon(
+                    icon=self.icon,
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 1),
+                    font_size='19sp',
+                    size_hint_x=None,
+                    width=dp(22),
+                    pos_hint={'center_y': 0.5},
+                )
+                self._lbl = MDLabel(
+                    text=self.text,
+                    bold=True,
+                    font_size='13.5sp',
+                    font_name='ArabicFont',
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 1),
+                    halign='center',
+                    valign='middle',
+                    shorten=True,
+                    shorten_from='right',
+                    pos_hint={'center_y': 0.5},
+                )
+                self.add_widget(self._ico)
+                self.add_widget(self._lbl)
+                self.bind(
+                    text=lambda inst, val: setattr(self._lbl, 'text', val),
+                    icon=lambda inst, val: setattr(self._ico, 'icon', val),
+                )
+
+        class _ValidateCartButton(MDCard):
+            text = StringProperty('')
+            icon = StringProperty('check-circle-outline')
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.orientation = 'horizontal'
+                self.size_hint = (1, None)
+                self.height = dp(52)
+                self.radius = [14]
+                self.elevation = 2
+                self.ripple_behavior = True
+                self.spacing = dp(8)
+
+                self._ico = MDIcon(
+                    icon=self.icon,
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 1),
+                    font_size='22sp',
+                    size_hint_x=None,
+                    width=dp(24),
+                    pos_hint={'center_y': 0.5},
+                )
+                self._lbl = MDLabel(
+                    text=self.text,
+                    bold=True,
+                    font_size='15.5sp',
+                    theme_text_color='Custom',
+                    text_color=(1, 1, 1, 1),
+                    adaptive_width=True,
+                    valign='middle',
+                    pos_hint={'center_y': 0.5},
+                )
+                self.add_widget(MDBoxLayout())
+                self.add_widget(self._ico)
+                self.add_widget(self._lbl)
+                self.add_widget(MDBoxLayout())
+                self.bind(
+                    text=lambda inst, val: setattr(self._lbl, 'text', val),
+                    icon=lambda inst, val: setattr(self._ico, 'icon', val),
+                )
+
+        screen = MDScreen(name='cart')
+        screen.md_bg_color = (0.95, 0.96, 0.98, 1)
+        layout = MDBoxLayout(orientation='vertical')
+
+        cart_header = MDBoxLayout(orientation='vertical', adaptive_height=True, md_bg_color=(1, 1, 1, 1))
+        self.cart_toolbar = self._create_modern_header(
+            'Panier',
+            on_back=lambda x: self.back_to_products(),
+            mode_icon='cart-check',
+        )
+        cart_header.add_widget(self.cart_toolbar)
+
+        self.cart_selectors_bar = MDCard(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=dp(64),
+            padding=[dp(12), dp(10)],
+            spacing=dp(10),
+            radius=[0],
+            elevation=0,
+            md_bg_color=(1, 1, 1, 1),
+        )
+        self.btn_ent_screen = _PillSelectorCard(
+            text='Client',
+            icon='account-outline',
+            size_hint_x=0.5,
+            md_bg_color=self.theme_cls.primary_color,
+            on_release=self.handle_entity_button_click,
+        )
+        self.btn_loc_screen = _PillSelectorCard(
+            text='Magasin',
+            icon='store',
+            size_hint_x=0.5,
+            md_bg_color=self.theme_cls.primary_color,
+            on_release=self.toggle_location,
+        )
+        self.cart_selectors_bar.add_widget(self.btn_ent_screen)
+        self.cart_selectors_bar.add_widget(self.btn_loc_screen)
+        cart_header.add_widget(self.cart_selectors_bar)
+        cart_header.add_widget(MDSeparator(height=dp(1), color=(0.89, 0.91, 0.94, 1)))
+        layout.add_widget(cart_header)
 
         self.rv_cart = CartRecycleView()
         layout.add_widget(self.rv_cart)
 
-        self.footer_card = MDCard(orientation='vertical', size_hint_y=None, height=dp(150), padding=dp(15), spacing=dp(10), radius=[20, 20, 0, 0], elevation=4)
-        total_row = MDBoxLayout(orientation='horizontal')
-        self.lbl_total_title = MDLabel(text='TOTAL :', bold=True, font_style='Subtitle1')
-        self.lbl_cart_screen_total = MDLabel(text='0,00 DA', halign='right', font_style='H5', bold=True, theme_text_color='Primary')
+        self.footer_card = MDCard(
+            orientation='vertical',
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=[dp(16), dp(14), dp(16), dp(14)],
+            spacing=dp(10),
+            radius=[22, 22, 0, 0],
+            elevation=2,
+            md_bg_color=(1, 1, 1, 1),
+            line_color=(0.88, 0.90, 0.94, 1),
+            line_width=1,
+        )
+        self.lbl_cart_breakdown = MDLabel(
+            text='',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Secondary',
+            halign='center',
+            size_hint_y=None,
+            height=0,
+            opacity=0,
+        )
+        total_row = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(36))
+        self.lbl_total_title = MDLabel(text='TOTAL :', bold=True, font_style='Subtitle1', theme_text_color='Secondary', valign='middle')
+        self.lbl_cart_screen_total = MDLabel(text='0,00 DA', halign='right', valign='middle', font_style='H5', bold=True, theme_text_color='Primary')
         total_row.add_widget(self.lbl_total_title)
         total_row.add_widget(self.lbl_cart_screen_total)
-        self.btn_validate_cart = MDFillRoundFlatButton(text='VALIDER LA COMMANDE', size_hint_x=1, height=dp(55), md_bg_color=(0, 0.7, 0.2, 1), on_release=self.open_payment_dialog)
+
+        self.btn_validate_cart = _ValidateCartButton(
+            text='VALIDER LA COMMANDE',
+            icon='check-circle-outline',
+            md_bg_color=(0, 0.65, 0.25, 1),
+            on_release=self.open_payment_dialog,
+        )
+        self.footer_card.add_widget(self.lbl_cart_breakdown)
         self.footer_card.add_widget(total_row)
         self.footer_card.add_widget(self.btn_validate_cart)
         layout.add_widget(self.footer_card)
         screen.add_widget(layout)
         return screen
 
+    def _show_empty_cart_dialog(self, title: str = 'Panier vide', message: str = 'Veuillez ajouter au moins un produit.'):
+        if getattr(self, 'dialog', None):
+            try:
+                self.dialog.dismiss()
+            except Exception:
+                pass
+
+        content = MDBoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            adaptive_height=True,
+            spacing=dp(12),
+            padding=[0, 0, 0, dp(2)],
+        )
+
+        badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(56)),
+            radius=[28],
+            elevation=0,
+            md_bg_color=(1, 0.95, 0.88, 1),
+            pos_hint={'center_x': 0.5},
+        )
+        b_fl = MDFloatLayout()
+        b_fl.add_widget(
+            MDIcon(
+                icon='cart-off',
+                theme_text_color='Custom',
+                text_color=(0.88, 0.45, 0.0, 1),
+                font_size='28sp',
+                size_hint=(None, None),
+                size=(dp(30), dp(30)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        badge.add_widget(b_fl)
+        content.add_widget(badge)
+
+        content.add_widget(
+            MDLabel(
+                text=title,
+                halign='center',
+                font_style='H6',
+                bold=True,
+                theme_text_color='Primary',
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+
+        msg_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.96, 0.97, 0.99, 1),
+            line_color=(0.88, 0.90, 0.94, 1),
+            line_width=1,
+            padding=[dp(14), dp(12)],
+        )
+        lbl_msg = MDLabel(
+            text=message,
+            halign='center',
+            font_style='Body2',
+            bold=True,
+            theme_text_color='Secondary',
+            size_hint_y=None,
+        )
+        lbl_msg.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(22), val[1])),
+        )
+        msg_card.add_widget(lbl_msg)
+        content.add_widget(msg_card)
+
+        btn_ok = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(48),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.09, 0.44, 0.84, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=lambda x: self.dialog.dismiss(),
+        )
+        btn_ok.add_widget(MDBoxLayout())
+        btn_ok.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDLabel(text='COMPRIS', bold=True, font_size='15sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDBoxLayout())
+        content.add_widget(btn_ok)
+
+        self.dialog = MDDialog(
+            title='',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.88, None),
+            radius=[20, 20, 20, 20],
+            buttons=[],
+        )
+        self.dialog.open()
+
     def open_cart_screen(self, x=None):
         if not self.cart:
-            self.dialog = MDDialog(title='Panier vide', text='Veuillez ajouter au moins un produit.', buttons=[MDFlatButton(text='OK', on_release=lambda x: self.dialog.dismiss())])
-            self.dialog.open()
+            self._show_empty_cart_dialog('Panier vide', 'Veuillez ajouter au moins un produit avant de continuer.')
             return
         if self.current_mode != 'transfer' and self.selected_entity is None:
             self.show_entity_selection_dialog(None, next_action=lambda: self.open_cart_screen(None))
@@ -5516,10 +7343,14 @@ class StockApp(MDApp):
     def toggle_location(self, x=None):
         self.selected_location = AppConstants.LOC_WAREHOUSE if self.selected_location == AppConstants.LOC_STORE else AppConstants.LOC_STORE
         self.update_location_display()
-        if self.current_mode == 'transfer' and hasattr(self, 'btn_ent_screen'):
+        if self.current_mode == 'transfer':
             src = AppConstants.LOC_LABELS[self.selected_location]
             dst = AppConstants.LOC_LABELS[AppConstants.LOC_WAREHOUSE if self.selected_location == AppConstants.LOC_STORE else AppConstants.LOC_STORE]
-            self.btn_ent_screen.text = f'{src}  >>>  {dst}'
+            txt = f'{src}  >>>  {dst}'
+            if hasattr(self, 'btn_ent_screen'):
+                self.btn_ent_screen.text = txt
+            if hasattr(self, 'prod_toolbar'):
+                self.prod_toolbar.subtitle = txt
 
     def update_location_display(self):
         if not hasattr(self, 'btn_loc_screen'):
@@ -5550,51 +7381,100 @@ class StockApp(MDApp):
             is_comptoir=is_comptoir,
         )
 
+        mode_colors = {
+            'sale': (0.06, 0.56, 0.24, 1),
+            'purchase': (0.88, 0.42, 0.0, 1),
+            'invoice_sale': (0.09, 0.44, 0.84, 1),
+            'invoice_purchase': (0.76, 0.14, 0.22, 1),
+            'proforma': (0.5, 0.12, 0.65, 1),
+            'order_purchase': (0.0, 0.5, 0.52, 1),
+            'return_sale': (0.82, 0.12, 0.12, 1),
+            'return_purchase': (0.0, 0.55, 0.55, 1),
+            'stock_in': (0.15, 0.38, 0.75, 1),
+            'stock_out': (0.48, 0.28, 0.12, 1),
+            'transfer': (0.5, 0.1, 0.58, 1),
+        }
+        hdr_col = mode_colors.get(self.current_mode, (0.09, 0.44, 0.84, 1))
         self.cart_toolbar.title = f'Panier ({len(self.cart)})'
+        self.cart_toolbar.subtitle = AppConstants.MODE_TITLES.get(self.current_mode, '')
+        self.cart_toolbar.md_bg_color = hdr_col
+        self.cart_toolbar.mode_icon = 'swap-horizontal' if is_transfer else 'cart-check'
         self.update_location_display()
 
         if is_qty_only:
-            self.lbl_total_title.text = 'Résumé :'
-            self.lbl_cart_screen_total.text = ''
-            self.lbl_cart_screen_total.opacity = 0
+            tot_q = sum((FinancialEngine.to_decimal(it.get('qty', 0)) for it in self.cart), Decimal('0'))
+            self.lbl_total_title.text = f'Résumé ({len(self.cart)} art.) :'
+            self.lbl_cart_screen_total.text = f'Qté tot. : {FinancialEngine.format_qty(tot_q)}'
+            self.lbl_cart_screen_total.opacity = 1
+            if hasattr(self, 'lbl_cart_breakdown'):
+                self.lbl_cart_breakdown.text = ''
+                self.lbl_cart_breakdown.height = 0
+                self.lbl_cart_breakdown.opacity = 0
         else:
             self.lbl_total_title.text = 'TOTAL (+Timbre) :' if calc['stamp_duty'] > 0 else 'TOTAL :'
             self.lbl_cart_screen_total.text = FinancialEngine.format_money(calc['final_total'])
             self.lbl_cart_screen_total.opacity = 1
+            if hasattr(self, 'lbl_cart_breakdown'):
+                parts = []
+                if calc['total_tva_final'] > 0 or calc['stamp_duty'] > 0 or calc['total_all_discounts_final'] > 0:
+                    parts.append(f"HT : {FinancialEngine.format_money(calc['total_ht_final'])}")
+                if calc['total_tva_final'] > 0:
+                    parts.append(f"TVA : {FinancialEngine.format_money(calc['total_tva_final'])}")
+                if calc['total_all_discounts_final'] > 0:
+                    parts.append(f"Remise : {FinancialEngine.format_money(calc['total_all_discounts_final'])}")
+                if calc['stamp_duty'] > 0:
+                    parts.append(f"Timbre : {FinancialEngine.format_money(calc['stamp_duty'])}")
+                if parts:
+                    self.lbl_cart_breakdown.text = '  •  '.join(parts)
+                    self.lbl_cart_breakdown.height = dp(20)
+                    self.lbl_cart_breakdown.opacity = 1
+                else:
+                    self.lbl_cart_breakdown.text = ''
+                    self.lbl_cart_breakdown.height = 0
+                    self.lbl_cart_breakdown.opacity = 0
 
         if is_transfer:
             src = AppConstants.LOC_LABELS[self.selected_location]
             dst = AppConstants.LOC_LABELS[AppConstants.LOC_WAREHOUSE if self.selected_location == AppConstants.LOC_STORE else AppConstants.LOC_STORE]
             self.btn_ent_screen.text = f'{src}  >>>  {dst}'
+            self.btn_ent_screen.icon = 'swap-horizontal'
             self.btn_ent_screen.md_bg_color = (0.5, 0, 0.5, 1)
             self.btn_validate_cart.text = 'VALIDER LE TRANSFERT'
+            self.btn_validate_cart.icon = 'swap-horizontal-bold'
             self.btn_validate_cart.md_bg_color = (0.5, 0, 0.5, 1)
         else:
             if self.selected_entity:
-                self.btn_ent_screen.text = self.fix_text(self.selected_entity.get('name', 'Tiers'))[:15]
+                self.btn_ent_screen.text = self.fix_text(self.selected_entity.get('name', 'Tiers'))
             vis = AppConstants.DOC_VISUALS.get(doc_type, {'color': (0, 0.6, 0.6, 1)})
+            self.btn_ent_screen.icon = 'truck-outline' if AppConstants.get_entity_type(doc_type) == AppConstants.ENTITY_SUPPLIER else 'account-outline'
             self.btn_ent_screen.md_bg_color = vis['color']
             self.btn_validate_cart.text = 'VALIDER LA COMMANDE'
-            self.btn_validate_cart.md_bg_color = (0, 0.7, 0.2, 1)
+            self.btn_validate_cart.icon = 'check-circle-outline'
+            self.btn_validate_cart.md_bg_color = (0, 0.65, 0.25, 1)
+
+        if hasattr(self, 'cart_selectors_bar'):
+            self.cart_selectors_bar.spacing = 0 if hide_loc else dp(10)
 
         if hide_loc:
-            self.btn_ent_screen.size_hint_x = 0.95
+            self.btn_ent_screen.size_hint_x = 1
             self.btn_loc_screen.opacity = 0
             self.btn_loc_screen.disabled = True
             self.btn_loc_screen.size_hint_x = 0
             self.btn_loc_screen.width = 0
         else:
-            self.btn_ent_screen.size_hint_x = 0.45
+            self.btn_ent_screen.size_hint_x = 0.5
             self.btn_loc_screen.opacity = 1
             self.btn_loc_screen.disabled = False
-            self.btn_loc_screen.size_hint_x = 0.45
+            self.btn_loc_screen.size_hint_x = 0.5
 
         rv_data = []
         for it in self.cart:
             q_disp = FinancialEngine.format_qty(it.get('qty', 0))
+            b_icon = 'pencil-plus-outline' if AppConstants.is_default_product(it) else 'package-variant'
             if is_qty_only:
-                det_txt = f'Qté : {q_disp}'
-                d_col = [0.1, 0.4, 0.8, 1]
+                det_txt = f'Quantité : {q_disp}'
+                sub_txt = ''
+                d_col = [0.08, 0.42, 0.78, 1]
             else:
                 line_calc = FinancialEngine.calculate_document_totals([it], doc_type=doc_type)
                 p = FinancialEngine.to_decimal(it.get('price', 0))
@@ -5602,9 +7482,16 @@ class StockApp(MDApp):
                 det_txt = f'{FinancialEngine.format_money(p)} x {q_disp}'
                 if t_rate > 0:
                     det_txt += f' (+{int(t_rate)}% TVA)'
-                det_txt += f" = {FinancialEngine.format_money(line_calc['final_total'])}"
-                d_col = [0.35, 0.35, 0.35, 1]
-            rv_data.append({'name': it.get('name', 'Article'), 'details': det_txt, 'd_color': d_col, 'raw_item': it})
+                sub_txt = FinancialEngine.format_money(line_calc['final_total'])
+                d_col = [0.06, 0.48, 0.24, 1]
+            rv_data.append({
+                'name': it.get('name', 'Article'),
+                'details': det_txt,
+                'subtotal': sub_txt,
+                'd_color': d_col,
+                'badge_icon': b_icon,
+                'raw_item': it,
+            })
 
         self.rv_cart.data = rv_data
         self.rv_cart.refresh_from_data()
@@ -5615,94 +7502,313 @@ class StockApp(MDApp):
         is_qty_only = doc_type in AppConstants.QTY_ONLY_DOC_TYPES
         is_virtual = AppConstants.is_default_product(item)
 
-        dialog_h = dp(580 if is_invoice else (360 if is_qty_only else 500))
-        content = MDBoxLayout(orientation='vertical', spacing='10dp', size_hint_y=None, height=dialog_h, padding=[0, '5dp', 0, 0])
+        base_h = 420 if is_qty_only else 505
+        if is_virtual:
+            base_h += 72
+        dialog_h = min(dp(base_h), Window.height * 0.85)
+
+        content = MDBoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, height=dialog_h, padding=[0, 0, 0, dp(2)])
         self.active_edit_target = 'qty'
         self.input_reset_mode = True
 
         def _upd_colors():
-            act, inact = (0.9, 1, 0.9, 1), (0.95, 0.95, 0.95, 1)
+            act_bg, act_border = (0.93, 0.99, 0.95, 1), (0.05, 0.62, 0.28, 1)
+            inact_bg, inact_border = (0.96, 0.97, 0.98, 1), (0.86, 0.88, 0.93, 1)
             for attr, key in (('edit_qty_card', 'qty'), ('edit_price_card', 'price'), ('edit_tva_card', 'tva'), ('edit_name_card', 'name')):
                 card = getattr(self, attr, None)
                 if card:
-                    card.md_bg_color = act if self.active_edit_target == key else inact
-                    card.elevation = 3 if self.active_edit_target == key else 0
+                    is_act = self.active_edit_target == key
+                    card.md_bg_color = act_bg if is_act else inact_bg
+                    card.line_color = act_border if is_act else inact_border
+                    card.line_width = 1.4 if is_act else 1.0
 
         if is_virtual:
-            self.edit_name_card = MDCard(size_hint_y=None, height='68dp', radius=[10], padding=[10, 0], elevation=0)
-            self.edit_name_field = SmartTextField(text=item.get('name', AppConstants.DEFAULT_PRODUCT_NAME), hint_text="Nom de l'article", font_size='20sp', halign='center', mode='line', line_color_normal=(0, 0, 0, 0), line_color_focus=(0, 0, 0, 0))
+            self.edit_name_card = MDCard(
+                size_hint=(1, None),
+                height=dp(62),
+                radius=[12],
+                elevation=0,
+                padding=[dp(12), dp(4)],
+                line_width=1,
+            )
+            self.edit_name_field = SmartTextField(
+                text=item.get('name', AppConstants.DEFAULT_PRODUCT_NAME),
+                hint_text="Nom de l'article",
+                font_size='18sp',
+                halign='center',
+                mode='line',
+                line_color_normal=(0, 0, 0, 0),
+                line_color_focus=(0, 0, 0, 0),
+                pos_hint={'center_y': 0.5},
+            )
             self.edit_name_field.bind(on_touch_down=lambda i, t: (setattr(self, 'active_edit_target', 'name'), _upd_colors(), False)[2] if i.collide_point(*t.pos) else False)
             self.edit_name_card.add_widget(self.edit_name_field)
-            n_row = MDBoxLayout(size_hint_y=None, height='72dp', padding=[20, 0])
-            n_row.add_widget(self.edit_name_card)
-            content.add_widget(n_row)
+            content.add_widget(self.edit_name_card)
         else:
             if hasattr(self, 'edit_name_field'):
                 del self.edit_name_field
             if hasattr(self, 'edit_name_card'):
                 del self.edit_name_card
-            content.add_widget(MDLabel(text=self.fix_text(item.get('name', 'Article')), halign='center', bold=True, font_style='Subtitle1', theme_text_color='Primary', adaptive_height=True))
+            lbl_title = MDLabel(
+                text=self.fix_text(item.get('name', 'Article')),
+                halign='center',
+                bold=True,
+                font_style='Subtitle1',
+                font_size='16sp',
+                font_name='ArabicFont',
+                theme_text_color='Primary',
+                size_hint_y=None,
+                max_lines=2,
+            )
+            lbl_title.bind(
+                width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+                texture_size=lambda inst, val: setattr(inst, 'height', max(dp(22), val[1])),
+            )
+            content.add_widget(lbl_title)
 
         if not is_qty_only:
-            self.edit_price_card = MDCard(size_hint_y=None, height='68dp', radius=[10], padding=[10, 0], elevation=0)
-            self.edit_price_field = NoMenuTextField(text=FinancialEngine.format_qty(item.get('price', 0)), hint_text='Prix (DA)', font_size='26sp', halign='center', mode='line', readonly=True, line_color_normal=(0, 0, 0, 0), line_color_focus=(0, 0, 0, 0))
-            self.edit_price_field.theme_text_color = 'Custom'
-            self.edit_price_field.text_color_normal = (0, 0, 0, 1)
-            self.edit_price_field.text_color_focus = (0, 0, 0, 1)
-            self.edit_price_field.bind(on_touch_down=lambda i, t: (setattr(self, 'input_reset_mode', self.active_edit_target != 'price' or self.input_reset_mode), setattr(self, 'active_edit_target', 'price'), _upd_colors(), True)[3] if i.collide_point(*t.pos) else False)
+            def _select_edit_price(*args):
+                if self.active_edit_target != 'price':
+                    self.input_reset_mode = True
+                self.active_edit_target = 'price'
+                _upd_colors()
+
+            price_tva_row = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint_y=None, height=dp(62))
+            self.edit_price_card = MDCard(
+                orientation='vertical',
+                size_hint_x=0.65 if is_invoice else 1,
+                size_hint_y=None,
+                height=dp(62),
+                radius=[12],
+                elevation=0,
+                padding=[dp(10), dp(5)],
+                spacing=dp(2),
+                ripple_behavior=True,
+                on_release=_select_edit_price,
+            )
+            self.edit_price_card.add_widget(
+                MDLabel(
+                    text='Prix Unitaire (DA)',
+                    font_style='Caption',
+                    bold=True,
+                    halign='center',
+                    theme_text_color='Secondary',
+                    size_hint_y=None,
+                    height=dp(15),
+                )
+            )
+            self.edit_price_field = MDLabel(
+                text=FinancialEngine.format_qty(item.get('price', 0)),
+                font_size='23sp',
+                bold=True,
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.1, 0.12, 0.16, 1),
+            )
             self.edit_price_card.add_widget(self.edit_price_field)
-            pr_row = MDBoxLayout(size_hint_y=None, height='72dp', padding=[60, 0])
-            pr_row.add_widget(self.edit_price_card)
-            content.add_widget(pr_row)
-        else:
-            if hasattr(self, 'edit_price_field'):
-                del self.edit_price_field
-            if hasattr(self, 'edit_price_card'):
-                del self.edit_price_card
+            price_tva_row.add_widget(self.edit_price_card)
 
-        if is_invoice:
-            self.edit_tva_card = MDCard(size_hint_y=None, height='58dp', radius=[10], padding=[10, 0], elevation=0)
-            self.edit_tva_field = NoMenuTextField(text=FinancialEngine.format_qty(item.get('tva', 0)), hint_text='TVA %', font_size='24sp', halign='center', mode='line', readonly=True, line_color_normal=(0, 0, 0, 0), line_color_focus=(0, 0, 0, 0))
-            self.edit_tva_field.theme_text_color = 'Custom'
-            self.edit_tva_field.text_color_normal = (0, 0, 0, 1)
-            self.edit_tva_field.text_color_focus = (0, 0, 0, 1)
-            self.edit_tva_field.bind(on_touch_down=lambda i, t: (setattr(self, 'input_reset_mode', self.active_edit_target != 'tva' or self.input_reset_mode), setattr(self, 'active_edit_target', 'tva'), _upd_colors(), True)[3] if i.collide_point(*t.pos) else False)
-            self.edit_tva_card.add_widget(self.edit_tva_field)
-            tv_row = MDBoxLayout(size_hint_y=None, height='62dp', padding=[100, 0])
-            tv_row.add_widget(self.edit_tva_card)
-            content.add_widget(tv_row)
-        else:
-            if hasattr(self, 'edit_tva_field'):
-                del self.edit_tva_field
-            if hasattr(self, 'edit_tva_card'):
-                del self.edit_tva_card
+            if is_invoice:
+                def _select_edit_tva(*args):
+                    if self.active_edit_target != 'tva':
+                        self.input_reset_mode = True
+                    self.active_edit_target = 'tva'
+                    _upd_colors()
 
-        qty_row = MDBoxLayout(orientation='horizontal', spacing='10dp', size_hint_y=None, height='65dp', padding=[40, 0])
-        btn_minus = MDIconButton(icon='minus', theme_text_color='Custom', text_color=(1, 1, 1, 1), md_bg_color=(0.9, 0.3, 0.3, 1), pos_hint={'center_y': 0.5})
-        self.edit_qty_card = MDCard(size_hint_x=1, size_hint_y=None, height='60dp', radius=[10], padding=[10, 0], elevation=0, pos_hint={'center_y': 0.5})
-        self.edit_qty_field = NoMenuTextField(text=FinancialEngine.format_qty(item.get('qty', 1)), hint_text='Qté', font_size='28sp', halign='center', readonly=True, mode='line', line_color_normal=(0, 0, 0, 0), line_color_focus=(0, 0, 0, 0))
-        self.edit_qty_field.theme_text_color = 'Custom'
-        self.edit_qty_field.text_color_normal = (0, 0, 0, 1)
-        self.edit_qty_field.text_color_focus = (0, 0, 0, 1)
-        self.edit_qty_field.bind(on_touch_down=lambda i, t: (setattr(self, 'input_reset_mode', self.active_edit_target != 'qty' or self.input_reset_mode), setattr(self, 'active_edit_target', 'qty'), _upd_colors(), True)[3] if i.collide_point(*t.pos) else False)
+                self.edit_tva_card = MDCard(
+                    orientation='vertical',
+                    size_hint_x=0.35,
+                    size_hint_y=None,
+                    height=dp(62),
+                    radius=[12],
+                    elevation=0,
+                    padding=[dp(8), dp(5)],
+                    spacing=dp(2),
+                    ripple_behavior=True,
+                    on_release=_select_edit_tva,
+                )
+                self.edit_tva_card.add_widget(
+                    MDLabel(
+                        text='TVA %',
+                        font_style='Caption',
+                        bold=True,
+                        halign='center',
+                        theme_text_color='Secondary',
+                        size_hint_y=None,
+                        height=dp(15),
+                    )
+                )
+                self.edit_tva_field = MDLabel(
+                    text=FinancialEngine.format_qty(item.get('tva', 0)),
+                    font_size='22sp',
+                    bold=True,
+                    halign='center',
+                    valign='middle',
+                    theme_text_color='Custom',
+                    text_color=(0.1, 0.12, 0.16, 1),
+                )
+                self.edit_tva_card.add_widget(self.edit_tva_field)
+                price_tva_row.add_widget(self.edit_tva_card)
+            else:
+                if hasattr(self, 'edit_tva_field'):
+                    del self.edit_tva_field
+                if hasattr(self, 'edit_tva_card'):
+                    del self.edit_tva_card
+
+            content.add_widget(price_tva_row)
+        else:
+            for attr in ('edit_price_field', 'edit_price_card', 'edit_tva_field', 'edit_tva_card'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
+        def _select_edit_qty(*args):
+            if self.active_edit_target != 'qty':
+                self.input_reset_mode = True
+            self.active_edit_target = 'qty'
+            _upd_colors()
+
+        qty_row = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(58))
+        btn_minus = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(58)),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(1, 0.93, 0.93, 1),
+            line_color=(0.94, 0.74, 0.74, 1),
+            line_width=1,
+            ripple_behavior=True,
+        )
+        m_fl = MDFloatLayout()
+        m_fl.add_widget(
+            MDIcon(
+                icon='minus',
+                theme_text_color='Custom',
+                text_color=(0.82, 0.12, 0.12, 1),
+                font_size='24sp',
+                size_hint=(None, None),
+                size=(dp(26), dp(26)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        btn_minus.add_widget(m_fl)
+
+        self.edit_qty_card = MDCard(
+            orientation='vertical',
+            size_hint_x=1,
+            size_hint_y=None,
+            height=dp(58),
+            radius=[12],
+            elevation=0,
+            padding=[dp(10), dp(4)],
+            spacing=dp(1),
+            ripple_behavior=True,
+            on_release=_select_edit_qty,
+        )
+        self.edit_qty_card.add_widget(
+            MDLabel(
+                text='Quantité',
+                font_style='Caption',
+                bold=True,
+                halign='center',
+                theme_text_color='Secondary',
+                size_hint_y=None,
+                height=dp(15),
+            )
+        )
+        self.edit_qty_field = MDLabel(
+            text=FinancialEngine.format_qty(item.get('qty', 1)),
+            font_size='25sp',
+            bold=True,
+            halign='center',
+            valign='middle',
+            theme_text_color='Custom',
+            text_color=(0.1, 0.12, 0.16, 1),
+        )
         self.edit_qty_card.add_widget(self.edit_qty_field)
-        btn_plus = MDIconButton(icon='plus', theme_text_color='Custom', text_color=(1, 1, 1, 1), md_bg_color=(0.2, 0.7, 0.2, 1), pos_hint={'center_y': 0.5})
+
+        btn_plus = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(58)),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.90, 0.98, 0.92, 1),
+            line_color=(0.68, 0.88, 0.74, 1),
+            line_width=1,
+            ripple_behavior=True,
+        )
+        p_fl = MDFloatLayout()
+        p_fl.add_widget(
+            MDIcon(
+                icon='plus',
+                theme_text_color='Custom',
+                text_color=(0.04, 0.58, 0.22, 1),
+                font_size='24sp',
+                size_hint=(None, None),
+                size=(dp(26), dp(26)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        btn_plus.add_widget(p_fl)
+
         qty_row.add_widget(btn_minus)
         qty_row.add_widget(self.edit_qty_card)
         qty_row.add_widget(btn_plus)
         content.add_widget(qty_row)
 
-        self.btn_save_edit = MDRaisedButton(text='MODIFIER', md_bg_color=(0, 0.6, 0.2, 1), text_color=(1, 1, 1, 1), size_hint_x=0.7, size_hint_y=1, font_size='18sp', elevation=3)
+        self.btn_save_edit = MDCard(
+            orientation='vertical',
+            size_hint_x=0.65,
+            size_hint_y=None,
+            height=dp(52),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.04, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            padding=[dp(8), dp(4)],
+            spacing=dp(1),
+        )
+        lbl_mod_main = MDLabel(
+            text='MODIFIER',
+            bold=True,
+            font_size='14.5sp',
+            halign='center',
+            valign='middle',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+        )
+        lbl_mod_sub = MDLabel(
+            text='',
+            bold=True,
+            font_size='13sp',
+            halign='center',
+            valign='middle',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 0.92),
+            size_hint_y=None,
+            height=0,
+            opacity=0,
+        )
+        self.btn_save_edit.add_widget(lbl_mod_main)
+        self.btn_save_edit.add_widget(lbl_mod_sub)
 
         def _upd_calc():
             if is_qty_only:
-                self.btn_save_edit.text = 'MODIFIER'
+                lbl_mod_sub.text = ''
+                lbl_mod_sub.height = 0
+                lbl_mod_sub.opacity = 0
                 return
             q = FinancialEngine.to_decimal(self.edit_qty_field.text or '0')
             p = FinancialEngine.to_decimal(self.edit_price_field.text or '0') if hasattr(self, 'edit_price_field') else Decimal('0')
             tva = FinancialEngine.to_decimal(self.edit_tva_field.text or '0') if hasattr(self, 'edit_tva_field') else Decimal('0')
             calc = FinancialEngine.calculate_document_totals([{'id': item['id'], 'qty': q, 'price': p, 'tva': tva}], doc_type=doc_type)
-            self.btn_save_edit.text = f"MODIFIER\n{FinancialEngine.format_money(calc['final_total'])}"
+            lbl_mod_sub.text = FinancialEngine.format_money(calc['final_total'])
+            lbl_mod_sub.height = dp(18)
+            lbl_mod_sub.opacity = 1
 
         def _delta_q(d: int):
             v = max(Decimal('1'), FinancialEngine.to_decimal(self.edit_qty_field.text or '0') + Decimal(d))
@@ -5747,12 +7853,56 @@ class StockApp(MDApp):
                 fld.text = fld.text[:-1]
             _upd_calc()
 
-        grid = MDGridLayout(cols=3, spacing='8dp', size_hint_y=1, padding=[20, 0])
+        grid = MDGridLayout(cols=3, spacing=dp(8), size_hint_y=1)
         for key in ('7', '8', '9', '4', '5', '6', '1', '2', '3', '.', '0', 'DEL'):
             if key == 'DEL':
-                grid.add_widget(MDIconButton(icon='backspace-outline', theme_text_color='Custom', text_color=(0, 0, 0, 1), md_bg_color=(0.8, 0.8, 0.8, 1), size_hint=(1, 1), on_release=_bkspc))
+                del_card = MDCard(
+                    md_bg_color=(1, 0.93, 0.93, 1),
+                    line_color=(0.94, 0.78, 0.78, 1),
+                    line_width=1,
+                    radius=[12],
+                    elevation=0,
+                    ripple_behavior=True,
+                    on_release=_bkspc,
+                )
+                d_fl = MDFloatLayout()
+                d_fl.add_widget(
+                    MDIcon(
+                        icon='backspace-outline',
+                        theme_text_color='Custom',
+                        text_color=(0.82, 0.14, 0.14, 1),
+                        font_size='22sp',
+                        size_hint=(None, None),
+                        size=(dp(24), dp(24)),
+                        halign='center',
+                        valign='middle',
+                        pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                    )
+                )
+                del_card.add_widget(d_fl)
+                grid.add_widget(del_card)
             else:
-                grid.add_widget(MDRaisedButton(text=key, md_bg_color=(0.95, 0.95, 0.95, 1), theme_text_color='Custom', text_color=(0, 0, 0, 1), font_size='22sp', size_hint=(1, 1), elevation=1, on_release=lambda x, k=key: _digit(k)))
+                key_card = MDCard(
+                    md_bg_color=(0.96, 0.97, 0.99, 1),
+                    line_color=(0.88, 0.90, 0.94, 1),
+                    line_width=1,
+                    radius=[12],
+                    elevation=0,
+                    ripple_behavior=True,
+                    on_release=lambda x, k=key: _digit(k),
+                )
+                key_card.add_widget(
+                    MDLabel(
+                        text=key,
+                        halign='center',
+                        valign='middle',
+                        font_size='21sp',
+                        bold=True,
+                        theme_text_color='Custom',
+                        text_color=(0.12, 0.14, 0.18, 1),
+                    )
+                )
+                grid.add_widget(key_card)
         content.add_widget(grid)
 
         def _save_edit(x):
@@ -5786,14 +7936,42 @@ class StockApp(MDApp):
             self.notify('Modifié avec succès.', 'success')
 
         self.btn_save_edit.bind(on_release=_save_edit)
-        btns = MDBoxLayout(orientation='horizontal', spacing='10dp', size_hint_y=None, height='60dp')
-        btns.add_widget(MDFlatButton(text='ANNULER', theme_text_color='Custom', text_color=(0.5, 0.5, 0.5, 1), size_hint_x=0.3, on_release=lambda x: self.edit_dialog.dismiss()))
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(52))
+        btn_cancel = MDCard(
+            size_hint_x=0.35,
+            size_hint_y=None,
+            height=dp(52),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.edit_dialog.dismiss(),
+        )
+        btn_cancel.add_widget(
+            MDLabel(
+                text='ANNULER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+        btns.add_widget(btn_cancel)
         btns.add_widget(self.btn_save_edit)
         content.add_widget(btns)
 
         _upd_colors()
         _upd_calc()
-        self.edit_dialog = MDDialog(title='', type='custom', content_cls=content, buttons=[], size_hint=(0.85, None))
+        self.edit_dialog = MDDialog(
+            title='',
+            type='custom',
+            content_cls=content,
+            buttons=[],
+            size_hint=(0.90, None),
+            radius=[20, 20, 20, 20],
+        )
         self.edit_dialog.open()
 
     # --------------------------------------------------------------------------
@@ -5806,8 +7984,7 @@ class StockApp(MDApp):
         self._last_click_time = now
 
         if not self.cart:
-            self.dialog = MDDialog(title='Attention', text='Le panier est vide !', buttons=[MDFlatButton(text='OK', on_release=lambda x: self.dialog.dismiss())])
-            self.dialog.open()
+            self._show_empty_cart_dialog('Attention', 'Le panier est vide !\nVeuillez ajouter au moins un produit.')
             return
 
         doc_type = self.editing_doc_type or AppConstants.get_doc_type_for_mode(self.current_mode)
@@ -5865,34 +8042,78 @@ class StockApp(MDApp):
                     self.current_method_index = idx
                     break
 
+        target_h = min(dp(585 if self.show_tax_details else 550), Window.height * 0.88)
         content = MDBoxLayout(
             orientation='vertical',
-            spacing='10dp',
+            spacing=dp(9),
             size_hint_y=None,
-            height=dp(640 if self.show_tax_details else 580),
-            padding=['10dp', '0dp', '10dp', '20dp'],
+            height=target_h,
+            padding=[0, 0, 0, dp(2)],
         )
-        header_box = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(50), spacing=dp(10))
-        header_box.add_widget(MDLabel(text='Paiement', font_style='H5', bold=True, theme_text_color='Primary', valign='center'))
+
+        header_box = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(38), spacing=dp(8))
+        header_box.add_widget(MDLabel(text='Paiement', font_style='H6', bold=True, theme_text_color='Primary', valign='center', size_hint_x=1))
+
         if self.is_facture_tax:
-            self.btn_payment_method = MDRaisedButton(
+            class _MethodPill(MDCard):
+                text = StringProperty('')
+
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.orientation = 'horizontal'
+                    self.size_hint = (None, None)
+                    self.size = (dp(168), dp(36))
+                    self.radius = [10]
+                    self.elevation = 0
+                    self.md_bg_color = (0.90, 0.95, 1, 1)
+                    self.line_color = (0.1, 0.45, 0.85, 0.45)
+                    self.line_width = 1
+                    self.ripple_behavior = True
+                    self.padding = [dp(10), 0, dp(8), 0]
+                    self.spacing = dp(6)
+                    self.pos_hint = {'center_y': 0.5}
+
+                    self.add_widget(MDIcon(icon='credit-card-outline', theme_text_color='Custom', text_color=(0.08, 0.4, 0.78, 1), font_size='17sp', size_hint_x=None, width=dp(18), pos_hint={'center_y': 0.5}))
+                    self._lbl = MDLabel(text=self.text, bold=True, font_size='13sp', theme_text_color='Custom', text_color=(0.08, 0.35, 0.72, 1), halign='center', valign='middle', max_lines=1, shorten=False)
+                    self.add_widget(self._lbl)
+                    self.add_widget(MDIcon(icon='chevron-down', theme_text_color='Custom', text_color=(0.08, 0.4, 0.78, 1), font_size='17sp', size_hint_x=None, width=dp(18), pos_hint={'center_y': 0.5}))
+                    self.bind(text=lambda inst, val: setattr(self._lbl, 'text', val))
+
+            self.btn_payment_method = _MethodPill(
                 text=self.payment_methods[self.current_method_index]['label'],
-                md_bg_color=(0.2, 0.2, 0.2, 1),
-                elevation=2,
-                pos_hint={'center_y': 0.5},
                 on_release=self._cycle_payment_method,
             )
             header_box.add_widget(self.btn_payment_method)
         content.add_widget(header_box)
 
-        total_card = MDCard(orientation='vertical', size_hint_y=None, height=dp(125 if self.show_tax_details else 90), radius=[10], md_bg_color=(0.95, 0.95, 0.95, 1), elevation=1, padding='5dp', ripple_behavior=True)
+        total_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            height=dp(106 if self.show_tax_details else 80),
+            radius=[14],
+            md_bg_color=(0.94, 0.97, 1, 1),
+            line_color=(0.76, 0.85, 0.96, 1),
+            line_width=1.1,
+            elevation=0,
+            padding=[dp(12), dp(8)],
+            spacing=dp(4),
+            ripple_behavior=True,
+        )
         total_card.bind(on_release=lambda inst: [setattr(self.txt_paid, 'text', f'{self.current_final_total:.2f}'), self._recalc_ui_totals()])
 
+        top_tot = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(18))
+        top_tot.add_widget(MDLabel(text='NET À PAYER', halign='left', font_style='Caption', bold=True, theme_text_color='Custom', text_color=(0.1, 0.4, 0.75, 1)))
+        top_tot.add_widget(MDLabel(text='Toucher = tout payer', halign='right', font_style='Caption', theme_text_color='Custom', text_color=(0.35, 0.52, 0.72, 1)))
+        total_card.add_widget(top_tot)
+
+        self.lbl_final_total = MDLabel(text='', halign='center', valign='middle', font_style='H5', font_size='26sp', bold=True, theme_text_color='Custom', text_color=(0.08, 0.12, 0.18, 1))
+        total_card.add_widget(self.lbl_final_total)
+
         if self.show_tax_details:
-            det_box = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(25), padding=[dp(5), 0], spacing=dp(5))
-            self.lbl_pay_ht = MDLabel(text='', theme_text_color='Secondary', font_style='Caption', halign='left', bold=True, size_hint_x=0.33)
-            self.lbl_timbre = MDLabel(text='', theme_text_color='Custom', text_color=(0.5, 0, 0.5, 1), font_style='Caption', halign='center', bold=True, size_hint_x=0.33)
-            self.lbl_pay_tva = MDLabel(text='', theme_text_color='Custom', text_color=(0.8, 0, 0, 1), font_style='Caption', halign='right', bold=True, size_hint_x=0.33)
+            det_box = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(20), spacing=dp(4))
+            self.lbl_pay_ht = MDLabel(text='', theme_text_color='Secondary', font_style='Caption', font_size='11sp', halign='left', bold=True, size_hint_x=0.34, shorten=True)
+            self.lbl_timbre = MDLabel(text='', theme_text_color='Custom', text_color=(0.5, 0, 0.5, 1), font_style='Caption', font_size='11sp', halign='center', bold=True, size_hint_x=0.33, shorten=True)
+            self.lbl_pay_tva = MDLabel(text='', theme_text_color='Custom', text_color=(0.8, 0.1, 0.1, 1), font_style='Caption', font_size='11sp', halign='right', bold=True, size_hint_x=0.33, shorten=True)
             det_box.add_widget(self.lbl_pay_ht)
             det_box.add_widget(self.lbl_timbre)
             det_box.add_widget(self.lbl_pay_tva)
@@ -5902,28 +8123,61 @@ class StockApp(MDApp):
             self.lbl_timbre = None
             self.lbl_pay_tva = None
 
-        tot_box = MDBoxLayout(orientation='vertical', spacing=0)
-        tot_box.add_widget(MDLabel(text='NET À PAYER', halign='center', font_style='Caption', theme_text_color='Secondary', size_hint_y=None, height=dp(20)))
-        self.lbl_final_total = MDLabel(text='', halign='center', font_style='H4', bold=True, theme_text_color='Primary')
-        tot_box.add_widget(self.lbl_final_total)
-        total_card.add_widget(tot_box)
         content.add_widget(total_card)
 
-        self.txt_paid = MDTextField(
-            text=f'{FinancialEngine.quantize_money(self.editing_payment_amount):.2f}',
-            hint_text='Montant Versé (DA)',
-            font_size='40sp',
-            halign='center',
-            readonly=True,
-            size_hint_y=None,
-            height=dp(80),
-            mode='fill',
-            line_color_focus=(0, 0, 0, 0),
+        paid_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            height=dp(72),
+            radius=[14],
+            elevation=0,
+            md_bg_color=(0.93, 0.99, 0.95, 1),
+            line_color=(0.05, 0.62, 0.28, 1),
+            line_width=1.4,
+            padding=[dp(12), dp(6)],
+            spacing=dp(2),
         )
-        content.add_widget(self.txt_paid)
+        paid_hdr = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(18))
+        paid_hdr.add_widget(MDLabel(text='MONTANT VERSÉ (DA)', font_style='Caption', bold=True, halign='center', theme_text_color='Custom', text_color=(0.04, 0.52, 0.22, 1)))
+        paid_card.add_widget(paid_hdr)
 
-        self.lbl_rest = MDLabel(text='', halign='center', theme_text_color='Custom', font_style='H6', bold=True, size_hint_y=None, height=dp(30))
-        content.add_widget(self.lbl_rest)
+        paid_val_row = MDFloatLayout(size_hint_y=1)
+        self.txt_paid = MDLabel(
+            text=f'{FinancialEngine.quantize_money(self.editing_payment_amount):.2f}',
+            font_size='30sp',
+            bold=True,
+            halign='center',
+            valign='middle',
+            theme_text_color='Custom',
+            text_color=(0.08, 0.1, 0.14, 1),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+        )
+        btn_clr_paid = MDIconButton(
+            icon='close-circle-outline',
+            theme_text_color='Custom',
+            text_color=(0.45, 0.52, 0.48, 1),
+            icon_size='20sp',
+            pos_hint={'right': 1.0, 'center_y': 0.5},
+            on_release=lambda *a: [setattr(self.txt_paid, 'text', '0.00'), self._recalc_ui_totals()],
+        )
+        paid_val_row.add_widget(self.txt_paid)
+        paid_val_row.add_widget(btn_clr_paid)
+        paid_card.add_widget(paid_val_row)
+        content.add_widget(paid_card)
+
+        self.rest_card = MDCard(
+            size_hint=(1, None),
+            height=dp(36),
+            radius=[10],
+            elevation=0,
+            md_bg_color=(1, 0.93, 0.93, 1),
+            line_color=(0.94, 0.74, 0.74, 1),
+            line_width=1,
+            padding=[dp(10), 0],
+        )
+        self.lbl_rest = MDLabel(text='', halign='center', valign='middle', theme_text_color='Custom', font_style='Subtitle1', font_size='15.5sp', bold=True)
+        self.rest_card.add_widget(self.lbl_rest)
+        content.add_widget(self.rest_card)
 
         def _digit(d: str):
             cur = self.txt_paid.text
@@ -5937,27 +8191,116 @@ class StockApp(MDApp):
             self._recalc_ui_totals()
 
         def _bkspc(inst=None):
-            if self.txt_paid.text:
+            if self.txt_paid.text and self.txt_paid.text != '0.00':
                 self.txt_paid.text = self.txt_paid.text[:-1]
             if not self.txt_paid.text:
-                self.txt_paid.text = '0'
+                self.txt_paid.text = '0.00'
             self._recalc_ui_totals()
 
-        grid = MDGridLayout(cols=3, spacing='10dp', size_hint_y=1)
+        grid = MDGridLayout(cols=3, spacing=dp(8), size_hint_y=1)
         for key in ('7', '8', '9', '4', '5', '6', '1', '2', '3', '.', '0', 'DEL'):
             if key == 'DEL':
-                grid.add_widget(MDIconButton(icon='backspace', theme_text_color='Custom', text_color=(1, 1, 1, 1), md_bg_color=(0.4, 0.4, 0.4, 1), size_hint=(1, 1), on_release=_bkspc))
+                del_card = MDCard(
+                    md_bg_color=(1, 0.93, 0.93, 1),
+                    line_color=(0.94, 0.78, 0.78, 1),
+                    line_width=1,
+                    radius=[12],
+                    elevation=0,
+                    ripple_behavior=True,
+                    on_release=_bkspc,
+                )
+                d_fl = MDFloatLayout()
+                d_fl.add_widget(
+                    MDIcon(
+                        icon='backspace-outline',
+                        theme_text_color='Custom',
+                        text_color=(0.82, 0.14, 0.14, 1),
+                        font_size='22sp',
+                        size_hint=(None, None),
+                        size=(dp(24), dp(24)),
+                        halign='center',
+                        valign='middle',
+                        pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                    )
+                )
+                del_card.add_widget(d_fl)
+                grid.add_widget(del_card)
             else:
-                grid.add_widget(MDRaisedButton(text=key, md_bg_color=(1, 1, 1, 1), theme_text_color='Custom', text_color=(0, 0, 0, 1), font_size='24sp', size_hint=(1, 1), elevation=1, on_release=lambda x, k=key: _digit(k)))
+                key_card = MDCard(
+                    md_bg_color=(0.96, 0.97, 0.99, 1),
+                    line_color=(0.88, 0.90, 0.94, 1),
+                    line_width=1,
+                    radius=[12],
+                    elevation=0,
+                    ripple_behavior=True,
+                    on_release=lambda x, k=key: _digit(k),
+                )
+                key_card.add_widget(
+                    MDLabel(
+                        text=key,
+                        halign='center',
+                        valign='middle',
+                        font_size='21sp',
+                        bold=True,
+                        theme_text_color='Custom',
+                        text_color=(0.12, 0.14, 0.18, 1),
+                    )
+                )
+                grid.add_widget(key_card)
         content.add_widget(grid)
-        content.add_widget(MDBoxLayout(size_hint_y=None, height='12dp'))
 
-        btns = MDBoxLayout(orientation='horizontal', spacing='10dp', size_hint_y=None, height='55dp')
-        btns.add_widget(MDFlatButton(text='ANNULER', theme_text_color='Custom', text_color=(0.5, 0.5, 0.5, 1), size_hint_x=0.3, on_release=lambda x: self.pay_dialog.dismiss()))
-        btns.add_widget(MDRaisedButton(text='VALIDER', md_bg_color=(0, 0.7, 0.2, 1), text_color=(1, 1, 1, 1), size_hint_x=0.7, size_hint_y=1, font_size='20sp', elevation=2, on_release=lambda x: self.finalize_submission(self.current_final_total)))
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(52))
+        btn_cancel = MDCard(
+            size_hint_x=0.35,
+            size_hint_y=None,
+            height=dp(52),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.pay_dialog.dismiss(),
+        )
+        btn_cancel.add_widget(
+            MDLabel(
+                text='ANNULER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+
+        btn_valid = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.65,
+            size_hint_y=None,
+            height=dp(52),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.04, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=lambda x: self.finalize_submission(self.current_final_total),
+        )
+        btn_valid.add_widget(MDBoxLayout())
+        btn_valid.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        btn_valid.add_widget(MDLabel(text='VALIDER', bold=True, font_size='16sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_valid.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_cancel)
+        btns.add_widget(btn_valid)
         content.add_widget(btns)
 
-        self.pay_dialog = MDDialog(title='', type='custom', content_cls=content, buttons=[], size_hint=(0.94, 0.98))
+        self.pay_dialog = MDDialog(
+            title='',
+            type='custom',
+            content_cls=content,
+            buttons=[],
+            size_hint=(0.92, None),
+            radius=[20, 20, 20, 20],
+        )
         self._recalc_ui_totals()
         self.pay_dialog.open()
 
@@ -5991,12 +8334,24 @@ class StockApp(MDApp):
         self.lbl_final_total.text = FinancialEngine.format_money(self.current_final_total)
         paid = FinancialEngine.to_decimal(self.txt_paid.text or '0')
         diff = FinancialEngine.quantize_money(self.current_final_total - paid)
-        if diff >= 0:
+        if diff > 0:
             self.lbl_rest.text = f'RESTE : {FinancialEngine.format_money(diff)}'
-            self.lbl_rest.text_color = (0.8, 0, 0, 1)
+            self.lbl_rest.text_color = (0.82, 0.1, 0.1, 1)
+            if hasattr(self, 'rest_card'):
+                self.rest_card.md_bg_color = (1, 0.93, 0.93, 1)
+                self.rest_card.line_color = (0.94, 0.74, 0.74, 1)
+        elif diff == 0:
+            self.lbl_rest.text = 'RESTE : 0,00 DA'
+            self.lbl_rest.text_color = (0.04, 0.56, 0.22, 1)
+            if hasattr(self, 'rest_card'):
+                self.rest_card.md_bg_color = (0.90, 0.98, 0.92, 1)
+                self.rest_card.line_color = (0.68, 0.88, 0.74, 1)
         else:
-            self.lbl_rest.text = f'RENDU : {FinancialEngine.format_money(abs(diff))}'
-            self.lbl_rest.text_color = (0, 0.6, 0.2, 1)
+            self.lbl_rest.text = f'EXCÉDENT / VERSEMENT : {FinancialEngine.format_money(abs(diff))}'
+            self.lbl_rest.text_color = (0.04, 0.56, 0.22, 1)
+            if hasattr(self, 'rest_card'):
+                self.rest_card.md_bg_color = (0.90, 0.98, 0.92, 1)
+                self.rest_card.line_color = (0.68, 0.88, 0.74, 1)
 
     def finalize_submission(self, total_amount: Decimal):
         if self.is_transaction_in_progress:
@@ -6031,32 +8386,287 @@ class StockApp(MDApp):
         )
 
     def show_overpayment_dialog(self, paid: Decimal, total: Decimal, excess: Decimal, method: str):
-        content = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True, spacing='14dp', padding=[0, '10dp', 0, 0])
-        content.add_widget(MDLabel(text=f'[b]Montant saisi :[/b] {FinancialEngine.format_money(paid)}\n[b]Total :[/b] {FinancialEngine.format_money(total)}', markup=True, halign='center', adaptive_height=True))
-        content.add_widget(MDLabel(text=f"L'excédent [color=#00C853][b]({FinancialEngine.format_money(excess)})[/b][/color] sera enregistré comme une opération séparée [b](VERSEMENT / RÈGLEMENT)[/b].", markup=True, halign='center', adaptive_height=True))
+        content = MDBoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            adaptive_height=True,
+            spacing=dp(12),
+            padding=[0, 0, 0, dp(2)],
+        )
+
+        badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(56)),
+            radius=[28],
+            elevation=0,
+            md_bg_color=(0.90, 0.98, 0.92, 1),
+            pos_hint={'center_x': 0.5},
+        )
+        b_fl = MDFloatLayout()
+        b_fl.add_widget(
+            MDIcon(
+                icon='cash-plus',
+                theme_text_color='Custom',
+                text_color=(0.04, 0.62, 0.25, 1),
+                font_size='30sp',
+                size_hint=(None, None),
+                size=(dp(32), dp(32)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        badge.add_widget(b_fl)
+        content.add_widget(badge)
+
+        content.add_widget(
+            MDLabel(
+                text="Création d'un versement",
+                halign='center',
+                font_style='H6',
+                bold=True,
+                theme_text_color='Primary',
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+
+        summary_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.96, 0.97, 0.99, 1),
+            line_color=(0.88, 0.90, 0.94, 1),
+            line_width=1,
+            padding=[dp(14), dp(10)],
+            spacing=dp(6),
+        )
+
+        def _sum_row(lbl_txt: str, val_txt: str, val_col=(0.1, 0.12, 0.16, 1), lbl_col=(0.42, 0.46, 0.52, 1), is_bold: bool = False):
+            r = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(22))
+            r.add_widget(MDLabel(text=lbl_txt, font_style='Body2', bold=is_bold, theme_text_color='Custom', text_color=lbl_col, halign='left', valign='middle', size_hint_x=0.52))
+            r.add_widget(MDLabel(text=val_txt, font_style='Body2', bold=True, theme_text_color='Custom', text_color=val_col, halign='right', valign='middle', size_hint_x=0.48))
+            return r
+
+        summary_card.add_widget(_sum_row('Montant saisi :', FinancialEngine.format_money(paid)))
+        summary_card.add_widget(_sum_row('Total document :', FinancialEngine.format_money(total)))
+        summary_card.add_widget(MDSeparator(height=dp(1), color=(0.86, 0.88, 0.92, 1)))
+        summary_card.add_widget(_sum_row('Excédent (Versement) :', f'+ {FinancialEngine.format_money(excess)}', val_col=(0.04, 0.58, 0.22, 1), lbl_col=(0.04, 0.58, 0.22, 1), is_bold=True))
+        content.add_widget(summary_card)
+
+        note_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0.91, 0.98, 0.93, 1),
+            line_color=(0.72, 0.88, 0.76, 1),
+            line_width=1,
+            padding=[dp(12), dp(8)],
+        )
+        lbl_note = MDLabel(
+            text="L'excédent sera enregistré comme une opération séparée (VERSEMENT / RÈGLEMENT).",
+            halign='center',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Custom',
+            text_color=(0.06, 0.45, 0.2, 1),
+            size_hint_y=None,
+        )
+        lbl_note.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(20), val[1])),
+        )
+        note_card.add_widget(lbl_note)
+        content.add_widget(note_card)
+
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(48), padding=[0, dp(2), 0, 0])
+        btn_fix = MDCard(
+            size_hint_x=0.42,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: [self.overpay_dialog.dismiss(), self.open_payment_dialog(None)],
+        )
+        btn_fix.add_widget(MDLabel(text='CORRIGER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_ok = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.58,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.04, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=lambda x: [self.overpay_dialog.dismiss(), self.process_transaction(paid, total, method=method)],
+        )
+        btn_ok.add_widget(MDBoxLayout())
+        btn_ok.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDLabel(text='CONFIRMER', bold=True, font_size='14.5sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_fix)
+        btns.add_widget(btn_ok)
+        content.add_widget(btns)
+
         self.overpay_dialog = MDDialog(
-            title="Création d'un versement",
+            title='',
             type='custom',
             content_cls=content,
-            buttons=[
-                MDFlatButton(text='CORRIGER', on_release=lambda x: [self.overpay_dialog.dismiss(), self.open_payment_dialog(None)]),
-                MDRaisedButton(text='CONFIRMER', md_bg_color=(0, 0.7, 0.2, 1), on_release=lambda x: [self.overpay_dialog.dismiss(), self.process_transaction(paid, total, method=method)]),
-            ],
+            size_hint=(0.90, None),
+            radius=[20, 20, 20, 20],
+            buttons=[],
         )
         self.overpay_dialog.open()
 
     def show_credit_warning(self, paid: Decimal, total: Decimal, remaining: Decimal, method: str):
-        content = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True, spacing='14dp', padding=[0, '10dp', 0, 0])
-        content.add_widget(MDLabel(text=f'[b]Montant saisi :[/b] {FinancialEngine.format_money(paid)}\n[b]Total :[/b] {FinancialEngine.format_money(total)}', markup=True, halign='center', adaptive_height=True))
-        content.add_widget(MDLabel(text=f'Le montant versé est insuffisant.\nLe reste [color=#D32F2F][b]({FinancialEngine.format_money(remaining)})[/b][/color] sera enregistré en [b]CRÉDIT[/b].', markup=True, halign='center', adaptive_height=True))
+        content = MDBoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            adaptive_height=True,
+            spacing=dp(12),
+            padding=[0, 0, 0, dp(2)],
+        )
+
+        badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(56)),
+            radius=[28],
+            elevation=0,
+            md_bg_color=(1, 0.92, 0.92, 1),
+            pos_hint={'center_x': 0.5},
+        )
+        b_fl = MDFloatLayout()
+        b_fl.add_widget(
+            MDIcon(
+                icon='alert-circle-outline',
+                theme_text_color='Custom',
+                text_color=(0.82, 0.12, 0.12, 1),
+                font_size='30sp',
+                size_hint=(None, None),
+                size=(dp(32), dp(32)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        badge.add_widget(b_fl)
+        content.add_widget(badge)
+
+        content.add_widget(
+            MDLabel(
+                text='Attention : Crédit',
+                halign='center',
+                font_style='H6',
+                bold=True,
+                theme_text_color='Custom',
+                text_color=(0.78, 0.12, 0.12, 1),
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+
+        summary_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.96, 0.97, 0.99, 1),
+            line_color=(0.88, 0.90, 0.94, 1),
+            line_width=1,
+            padding=[dp(14), dp(10)],
+            spacing=dp(6),
+        )
+
+        def _sum_row(lbl_txt: str, val_txt: str, val_col=(0.1, 0.12, 0.16, 1), lbl_col=(0.42, 0.46, 0.52, 1), is_bold: bool = False):
+            r = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(22))
+            r.add_widget(MDLabel(text=lbl_txt, font_style='Body2', bold=is_bold, theme_text_color='Custom', text_color=lbl_col, halign='left', valign='middle', size_hint_x=0.50))
+            r.add_widget(MDLabel(text=val_txt, font_style='Body2', bold=True, theme_text_color='Custom', text_color=val_col, halign='right', valign='middle', size_hint_x=0.50))
+            return r
+
+        summary_card.add_widget(_sum_row('Montant saisi :', FinancialEngine.format_money(paid)))
+        summary_card.add_widget(_sum_row('Total document :', FinancialEngine.format_money(total)))
+        summary_card.add_widget(MDSeparator(height=dp(1), color=(0.86, 0.88, 0.92, 1)))
+        summary_card.add_widget(_sum_row('Reste en Crédit :', FinancialEngine.format_money(remaining), val_col=(0.82, 0.1, 0.1, 1), lbl_col=(0.82, 0.1, 0.1, 1), is_bold=True))
+        content.add_widget(summary_card)
+
+        note_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[10],
+            elevation=0,
+            md_bg_color=(1, 0.94, 0.94, 1),
+            line_color=(0.94, 0.76, 0.76, 1),
+            line_width=1,
+            padding=[dp(12), dp(8)],
+        )
+        lbl_note = MDLabel(
+            text='Le montant versé est insuffisant. Le reste sera enregistré en CRÉDIT.',
+            halign='center',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Custom',
+            text_color=(0.75, 0.12, 0.12, 1),
+            size_hint_y=None,
+        )
+        lbl_note.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(20), val[1])),
+        )
+        note_card.add_widget(lbl_note)
+        content.add_widget(note_card)
+
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(48), padding=[0, dp(2), 0, 0])
+        btn_cancel = MDCard(
+            size_hint_x=0.42,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.debt_dialog.dismiss(),
+        )
+        btn_cancel.add_widget(MDLabel(text='ANNULER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_ok = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.58,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.82, 0.12, 0.12, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=lambda x: [self.debt_dialog.dismiss(), self.process_transaction(paid, total, method=method)],
+        )
+        btn_ok.add_widget(MDBoxLayout())
+        btn_ok.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDLabel(text='CONFIRMER', bold=True, font_size='14.5sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_ok.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_cancel)
+        btns.add_widget(btn_ok)
+        content.add_widget(btns)
+
         self.debt_dialog = MDDialog(
-            title='Attention : Crédit',
+            title='',
             type='custom',
             content_cls=content,
-            buttons=[
-                MDFlatButton(text='ANNULER', on_release=lambda x: self.debt_dialog.dismiss()),
-                MDRaisedButton(text='CONFIRMER', md_bg_color=(0.8, 0, 0, 1), on_release=lambda x: [self.debt_dialog.dismiss(), self.process_transaction(paid, total, method=method)]),
-            ],
+            size_hint=(0.90, None),
+            radius=[20, 20, 20, 20],
+            buttons=[],
         )
         self.debt_dialog.open()
 
@@ -6149,14 +8759,72 @@ class StockApp(MDApp):
         self.entities_source_type = e_type
         title = 'Choisir un Fournisseur' if e_type == AppConstants.ENTITY_SUPPLIER else 'Choisir un Client'
 
-        content = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(580))
-        self.entity_search = SmartTextField(hint_text='Rechercher...', icon_right='magnify')
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(560), Window.height * 0.76),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+
+        search_card = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(50),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.95, 0.96, 0.98, 1),
+            line_color=(0.86, 0.88, 0.93, 1),
+            line_width=1,
+            padding=[dp(12), 0, dp(8), 0],
+            spacing=dp(8),
+        )
+        self.entity_search = SmartTextField(
+            hint_text='Rechercher par nom ou tél...',
+            mode='line',
+            line_color_normal=(0, 0, 0, 0),
+            line_color_focus=(0, 0, 0, 0),
+            icon_right='magnify',
+            pos_hint={'center_y': 0.5},
+        )
         self.entity_search.bind(text=self.filter_entities_paginated)
-        content.add_widget(self.entity_search)
+        search_card.add_widget(self.entity_search)
+        content.add_widget(search_card)
+
         self.rv_entity = EntityRecycleView()
+        self.rv_entity.size_hint_y = 1
         content.add_widget(self.rv_entity)
 
-        self.entity_dialog = MDDialog(title=title, type='custom', content_cls=content, size_hint=(0.9, 0.8))
+        btn_cancel = MDCard(
+            size_hint=(1, None),
+            height=dp(46),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.entity_dialog.dismiss() if getattr(self, 'entity_dialog', None) else None,
+        )
+        btn_cancel.add_widget(
+            MDLabel(
+                text='ANNULER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+        content.add_widget(btn_cancel)
+
+        self.entity_dialog = MDDialog(
+            title=title,
+            type='custom',
+            content_cls=content,
+            size_hint=(0.94, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.entity_dialog.open()
         self.active_entity_rv = self.rv_entity
         self.load_more_entities(reset=True)
@@ -6166,20 +8834,92 @@ class StockApp(MDApp):
         self.current_entity_sort = 'name'
         title = 'Gestion Clients' if entity_type == AppConstants.ENTITY_CLIENT else 'Gestion Fournisseurs'
 
-        content = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(600), spacing=dp(5))
-        search_row = MDBoxLayout(orientation='horizontal', spacing=dp(5), size_hint_y=None, height=dp(55))
-        self.entity_search = SmartTextField(hint_text='Rechercher...', icon_right='magnify', size_hint_x=0.85)
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(580), Window.height * 0.80),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+
+        search_row = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint=(1, None), height=dp(50))
+        search_card = MDCard(
+            orientation='horizontal',
+            size_hint_x=1,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.95, 0.96, 0.98, 1),
+            line_color=(0.86, 0.88, 0.93, 1),
+            line_width=1,
+            padding=[dp(12), 0, dp(8), 0],
+        )
+        self.entity_search = SmartTextField(
+            hint_text='Rechercher par nom ou tél...',
+            mode='line',
+            line_color_normal=(0, 0, 0, 0),
+            line_color_focus=(0, 0, 0, 0),
+            icon_right='magnify',
+            pos_hint={'center_y': 0.5},
+        )
         self.entity_search.bind(text=self.filter_entities_paginated)
-        self.btn_sort_entity = MDIconButton(icon='sort-alphabetical-variant', theme_text_color='Custom', text_color=(0.2, 0.2, 0.2, 1), md_bg_color=(0.95, 0.95, 0.95, 1), size_hint=(None, None), size=(dp(48), dp(48)), pos_hint={'center_y': 0.5}, on_release=self.toggle_entity_sort)
-        search_row.add_widget(self.entity_search)
+        search_card.add_widget(self.entity_search)
+
+        self.btn_sort_entity = MDIconButton(
+            icon='sort-alphabetical-variant',
+            theme_text_color='Custom',
+            text_color=(0.2, 0.2, 0.25, 1),
+            md_bg_color=(0.94, 0.95, 0.97, 1),
+            size_hint=(None, None),
+            size=(dp(48), dp(48)),
+            pos_hint={'center_y': 0.5},
+            on_release=self.toggle_entity_sort,
+        )
+        search_row.add_widget(search_card)
         search_row.add_widget(self.btn_sort_entity)
         content.add_widget(search_row)
 
         self.rv_mgmt_entity = MgmtEntityRecycleView()
+        self.rv_mgmt_entity.size_hint_y = 1
         content.add_widget(self.rv_mgmt_entity)
-        content.add_widget(MDFillRoundFlatButton(text='AJOUTER NOUVEAU', size_hint_x=1, md_bg_color=(0, 0.7, 0.2, 1), on_release=lambda x: self.show_add_edit_entity_dialog(None)))
 
-        self.mgmt_dialog = MDDialog(title=title, type='custom', content_cls=content, size_hint=(0.95, 0.9))
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(48))
+        btn_close = MDCard(
+            size_hint_x=0.35,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.mgmt_dialog.dismiss() if getattr(self, 'mgmt_dialog', None) else None,
+        )
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_add = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.65,
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.0, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=lambda x: self.show_add_edit_entity_dialog(None),
+        )
+        btn_add.add_widget(MDBoxLayout())
+        btn_add.add_widget(MDIcon(icon='account-plus-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        btn_add.add_widget(MDLabel(text='AJOUTER NOUVEAU', bold=True, font_size='14sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_add.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_close)
+        btns.add_widget(btn_add)
+        content.add_widget(btns)
+
+        self.mgmt_dialog = MDDialog(
+            title=title,
+            type='custom',
+            content_cls=content,
+            size_hint=(0.94, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.mgmt_dialog.open()
         self.active_entity_rv = self.rv_mgmt_entity
         self.load_more_entities(reset=True)
@@ -6244,14 +8984,26 @@ class StockApp(MDApp):
                 col_hex = 'D50000' if bal > 0 else '00C853'
                 rv_data.append({'raw_name': e['name'], 'balance_text': f'Solde : [color={col_hex}][b]{bal_str}[/b][/color]', 'raw_data': e, 'bg_color': bg_c})
             elif is_def:
-                rv_data.append({'raw_name': e['name'], 'balance_text': '[size=14sp][b][color=404040]-- Direct --[/color][/b][/size]', 'icon': 'store', 'icon_color': [0, 0.4, 0.7, 1], 'raw_data': e})
-            else:
-                col_hex = '00C853' if is_client else 'D50000'
                 rv_data.append({
                     'raw_name': e['name'],
-                    'balance_text': f'Solde : [color={col_hex}][b]{bal_str}[/b][/color]',
+                    'balance_text': '[b][color=1565C0]-- Direct (Comptoir) --[/color][/b]',
+                    'icon': 'store',
+                    'icon_color': [0.08, 0.42, 0.78, 1],
+                    'bg_color': [0.95, 0.97, 1, 1],
+                    'icon_bg': [0.86, 0.92, 1, 1],
+                    'raw_data': e,
+                })
+            else:
+                col_hex = 'D50000' if bal > 0 else '00A844'
+                cat = AppConstants.normalize_price_category(e.get('price_category', ''))
+                cat_suffix = f'  •  [color=555555]{cat}[/color]' if (is_client and cat != AppConstants.PRICE_CAT_DETAIL) else ''
+                rv_data.append({
+                    'raw_name': e['name'],
+                    'balance_text': f'Solde : [color={col_hex}][b]{bal_str}[/b][/color]{cat_suffix}',
                     'icon': 'account-check' if bal <= 0 else 'account-alert',
-                    'icon_color': [0, 0.7, 0.2, 1] if bal <= 0 else [0.9, 0, 0, 1],
+                    'icon_color': [0, 0.65, 0.25, 1] if bal <= 0 else [0.85, 0.1, 0.1, 1],
+                    'bg_color': [1, 1, 1, 1],
+                    'icon_bg': [0.91, 0.98, 0.93, 1] if bal <= 0 else [1, 0.92, 0.92, 1],
                     'raw_data': e,
                 })
 
@@ -6273,7 +9025,10 @@ class StockApp(MDApp):
             'category': AppConstants.normalize_price_category(entity_data.get('price_category', AppConstants.PRICE_CAT_DETAIL)),
         }
         if hasattr(self, 'btn_ent_screen'):
-            self.btn_ent_screen.text = self.fix_text(entity_data['name'])[:15]
+            self.btn_ent_screen.text = self.fix_text(entity_data['name'])
+        if hasattr(self, 'prod_toolbar'):
+            ent_lbl = 'Fournisseur' if AppConstants.get_entity_type(self.current_mode) == AppConstants.ENTITY_SUPPLIER else 'Client'
+            self.prod_toolbar.subtitle = f"{ent_lbl} : {self.fix_text(entity_data['name'])}"
         self.recalculate_cart_prices()
         if getattr(self, 'entity_dialog', None):
             self.entity_dialog.dismiss()
@@ -6291,27 +9046,96 @@ class StockApp(MDApp):
         self.show_simple_payment_dialog()
 
     def open_entity_edit_menu(self, entity: dict):
+        if getattr(self, 'options_dialog', None):
+            try:
+                self.options_dialog.dismiss()
+            except Exception:
+                pass
         gps_data = entity.get('gps_location', '')
-        content = MDBoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, height=dp(160), padding=[dp(15), 0, dp(15), dp(10)])
-        content.add_widget(
-            MDFillRoundFlatIconButton(
-                text='Localiser (Maps)',
-                icon='google-maps',
-                size_hint_x=1,
-                height=dp(50),
-                md_bg_color=(0.1, 0.7, 0.3, 1) if gps_data else (0.7, 0.7, 0.7, 1),
-                theme_text_color='Custom',
-                text_color=(1, 1, 1, 1),
-                icon_color=(1, 1, 1, 1),
-                on_release=lambda x: [self.options_dialog.dismiss(), self.open_client_location(gps_data)],
-            )
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=[dp(2), dp(6), dp(2), dp(2)],
         )
-        content.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.9, 1)))
-        row = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(50))
-        row.add_widget(MDFillRoundFlatIconButton(text='Modifier', icon='pencil', size_hint_x=0.5, height=dp(48), md_bg_color=(0.15, 0.45, 0.8, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), icon_color=(1, 1, 1, 1), on_release=lambda x: [self.options_dialog.dismiss(), self.show_add_edit_entity_dialog(entity)]))
-        row.add_widget(MDRoundFlatIconButton(text='Supprimer', icon='delete', size_hint_x=0.5, height=dp(48), theme_text_color='Custom', text_color=(0.85, 0.1, 0.1, 1), icon_color=(0.85, 0.1, 0.1, 1), line_color=(0.85, 0.1, 0.1, 1), on_release=lambda x: self.confirm_delete_entity(entity)))
-        content.add_widget(row)
-        self.options_dialog = MDDialog(title=self.fix_text(entity['name']), type='custom', content_cls=content, size_hint=(0.95, None), radius=[16, 16, 16, 16])
+
+        btn_gps = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(48),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.08, 0.62, 0.28, 1) if gps_data else (0.72, 0.74, 0.78, 1),
+            ripple_behavior=True,
+            spacing=dp(8),
+            on_release=lambda x: [self.options_dialog.dismiss(), self.open_client_location(gps_data)],
+        )
+        btn_gps.add_widget(MDBoxLayout())
+        btn_gps.add_widget(MDIcon(icon='google-maps', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='22sp', size_hint_x=None, width=dp(24), pos_hint={'center_y': 0.5}))
+        btn_gps.add_widget(MDLabel(text='Localiser (Maps)', bold=True, font_size='15sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_gps.add_widget(MDBoxLayout())
+        content.add_widget(btn_gps)
+
+        if not self.is_seller_mode:
+            row = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(46))
+
+            btn_edit = MDCard(
+                orientation='horizontal',
+                size_hint_x=0.5,
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.1, 0.45, 0.85, 1),
+                ripple_behavior=True,
+                spacing=dp(6),
+                on_release=lambda x: [self.options_dialog.dismiss(), self.show_add_edit_entity_dialog(entity)],
+            )
+            btn_edit.add_widget(MDBoxLayout())
+            btn_edit.add_widget(MDIcon(icon='pencil-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            btn_edit.add_widget(MDLabel(text='Modifier', bold=True, font_size='14.5sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+            btn_edit.add_widget(MDBoxLayout())
+
+            btn_del = MDCard(
+                orientation='horizontal',
+                size_hint_x=0.5,
+                radius=[12],
+                elevation=0,
+                md_bg_color=(1, 0.93, 0.93, 1),
+                line_color=(0.88, 0.22, 0.22, 1),
+                line_width=1,
+                ripple_behavior=True,
+                spacing=dp(6),
+                on_release=lambda x: self.confirm_delete_entity(entity),
+            )
+            btn_del.add_widget(MDBoxLayout())
+            btn_del.add_widget(MDIcon(icon='trash-can-outline', theme_text_color='Custom', text_color=(0.85, 0.12, 0.12, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            btn_del.add_widget(MDLabel(text='Supprimer', bold=True, font_size='14.5sp', theme_text_color='Custom', text_color=(0.85, 0.12, 0.12, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+            btn_del.add_widget(MDBoxLayout())
+
+            row.add_widget(btn_edit)
+            row.add_widget(btn_del)
+            content.add_widget(row)
+
+        btn_close = MDCard(
+            size_hint=(1, None),
+            height=dp(44),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.options_dialog.dismiss() if getattr(self, 'options_dialog', None) else None,
+        )
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+        content.add_widget(btn_close)
+
+        self.options_dialog = MDDialog(
+            title=self.fix_text(entity['name']),
+            type='custom',
+            content_cls=content,
+            size_hint=(0.90, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.options_dialog.open()
 
     def open_client_location(self, location_data: str):
@@ -6328,41 +9152,70 @@ class StockApp(MDApp):
 
     def show_add_edit_entity_dialog(self, entity=None):
         is_edit = entity is not None
-        scroll = MDScrollView(size_hint_y=None, height=dp(580))
-        main_box = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(14), padding=[dp(10), dp(10), dp(10), dp(20)])
+        is_client = self.current_entity_type_mgmt == AppConstants.ENTITY_CLIENT
+        dlg_title = (
+            ('Modifier Client' if is_edit else 'Nouveau Client')
+            if is_client
+            else ('Modifier Fournisseur' if is_edit else 'Nouveau Fournisseur')
+        )
 
-        card_id = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True)
-        card_id.add_widget(MDLabel(text='Identité', bold=True, theme_text_color='Primary', font_style='Subtitle1'))
+        wrapper = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(580), Window.height * 0.80),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+        scroll = MDScrollView(size_hint_y=1)
+        main_box = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(12), padding=[dp(2), dp(4), dp(4), dp(8)])
+
+        def _make_section(bg_col, border_col, icon_name: str, title_txt: str):
+            c = MDCard(
+                orientation='vertical',
+                radius=[14],
+                padding=dp(14),
+                spacing=dp(10),
+                elevation=0,
+                adaptive_height=True,
+                md_bg_color=bg_col,
+                line_color=border_col,
+                line_width=1,
+            )
+            hdr = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint_y=None, height=dp(26))
+            hdr.add_widget(MDIcon(icon=icon_name, theme_text_color='Primary', font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            hdr.add_widget(MDLabel(text=title_txt, bold=True, theme_text_color='Primary', font_style='Subtitle2', pos_hint={'center_y': 0.5}))
+            c.add_widget(hdr)
+            c.add_widget(MDSeparator(height=dp(1), color=(0, 0, 0, 0.08)))
+            return c
+
+        card_id = _make_section((1, 1, 1, 1), (0.88, 0.90, 0.94, 1), 'account-box-outline', 'Identité')
         f_name = SmartTextField(text=entity.get('name', '') if is_edit else '', hint_text='Nom Complet / Raison Sociale *', required=True, icon_right='account')
         f_act = SmartTextField(text=entity.get('activity', '') if is_edit else '', hint_text='Activité', icon_right='briefcase')
         card_id.add_widget(f_name)
         card_id.add_widget(f_act)
         main_box.add_widget(card_id)
 
-        card_ct = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(0.96, 0.98, 1, 1))
-        card_ct.add_widget(MDLabel(text='Coordonnées & GPS', bold=True, theme_text_color='Primary', font_style='Subtitle1'))
+        card_ct = _make_section((0.96, 0.98, 1, 1), (0.82, 0.89, 0.97, 1), 'card-account-phone-outline', 'Coordonnées & GPS')
         f_phone = SmartTextField(text=entity.get('phone', '') if is_edit else '', hint_text='Téléphone', icon_right='phone')
         f_addr = SmartTextField(text=entity.get('address', '') if is_edit else '', hint_text='Adresse', icon_right='map-marker')
         f_email = SmartTextField(text=entity.get('email', '') if is_edit else '', hint_text='Email', icon_right='email')
-        gps_row = MDBoxLayout(orientation='horizontal', spacing=dp(5), adaptive_height=True)
-        f_gps = SmartTextField(text=entity.get('gps_location', '') if is_edit else '', hint_text='Lien Maps / Position GPS', icon_right='google-maps', size_hint_x=0.85)
+        gps_row = MDBoxLayout(orientation='horizontal', spacing=dp(6), adaptive_height=True)
+        f_gps = SmartTextField(text=entity.get('gps_location', '') if is_edit else '', hint_text='Lien Maps / Position GPS', icon_right='google-maps', size_hint_x=1)
         gps_row.add_widget(f_gps)
-        gps_row.add_widget(MDIconButton(icon='content-paste', theme_text_color='Custom', text_color=self.theme_cls.primary_color, on_release=lambda x: f_gps.set_raw_value(Clipboard.paste())))
+        gps_row.add_widget(MDIconButton(icon='content-paste', theme_text_color='Custom', text_color=self.theme_cls.primary_color, pos_hint={'center_y': 0.5}, on_release=lambda x: f_gps.set_raw_value(Clipboard.paste())))
         for w in (f_phone, f_addr, gps_row, f_email):
             card_ct.add_widget(w)
         main_box.add_widget(card_ct)
 
         disp_cat = AppConstants.normalize_price_category(entity.get('price_category', AppConstants.PRICE_CAT_DETAIL) if is_edit else AppConstants.PRICE_CAT_DETAIL)
-        f_cat = MDTextField(text=disp_cat, hint_text='Catégorie de Prix', readonly=True, icon_right='tag')
+        f_cat = MDTextField(text=disp_cat, hint_text='Catégorie de Prix', readonly=True, icon_right='menu-down')
         f_cat.bind(on_touch_down=lambda i, t: (self.show_price_cat_selector(i), True)[1] if i.collide_point(*t.pos) else False)
-        if self.current_entity_type_mgmt == AppConstants.ENTITY_CLIENT:
-            card_cm = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True)
-            card_cm.add_widget(MDLabel(text='Commercial', bold=True, theme_text_color='Primary', font_style='Subtitle1'))
+        if is_client:
+            card_cm = _make_section((1, 0.98, 0.94, 1), (0.94, 0.87, 0.76, 1), 'store-cog-outline', 'Commercial')
             card_cm.add_widget(f_cat)
             main_box.add_widget(card_cm)
 
-        card_fisc = MDCard(orientation='vertical', radius=[12], padding=dp(15), spacing=dp(10), elevation=1, adaptive_height=True, md_bg_color=(0.95, 0.95, 0.95, 1))
-        card_fisc.add_widget(MDLabel(text='Informations Fiscales', bold=True, theme_text_color='Primary', font_style='Subtitle1'))
+        card_fisc = _make_section((0.97, 0.97, 0.98, 1), (0.88, 0.89, 0.92, 1), 'file-document-multiple-outline', 'Informations Fiscales')
         f_rc = SmartTextField(text=entity.get('rc', '') if is_edit else '', hint_text='N° Registre Commerce (RC)')
         f_nif = SmartTextField(text=entity.get('nif', '') if is_edit else '', hint_text='N.I.F')
         f_nis = SmartTextField(text=entity.get('nis', '') if is_edit else '', hint_text='N.I.S')
@@ -6370,6 +9223,9 @@ class StockApp(MDApp):
         for w in (f_rc, f_nif, f_nis, f_nai):
             card_fisc.add_widget(w)
         main_box.add_widget(card_fisc)
+
+        scroll.add_widget(main_box)
+        wrapper.add_widget(scroll)
 
         def _save(x):
             try:
@@ -6395,21 +9251,84 @@ class StockApp(MDApp):
             except Exception as exc:
                 self.notify(str(exc), 'error')
 
-        footer = MDBoxLayout(orientation='vertical', spacing=dp(10), adaptive_height=True, padding=[0, dp(10), 0, 0])
-        footer.add_widget(MDRaisedButton(text='ENREGISTRER', md_bg_color=(0, 0.7, 0.2, 1), text_color=(1, 1, 1, 1), size_hint_x=1, height=dp(50), on_release=_save))
-        footer.add_widget(MDRaisedButton(text='ANNULER', md_bg_color=(0.9, 0.9, 0.9, 1), text_color=(0.2, 0.2, 0.2, 1), size_hint_x=1, height=dp(50), on_release=lambda x: self.ae_dialog.dismiss()))
-        main_box.add_widget(footer)
-        scroll.add_widget(main_box)
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(48))
+        btn_cancel = MDCard(
+            size_hint_x=0.35,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.ae_dialog.dismiss() if getattr(self, 'ae_dialog', None) else None,
+        )
+        btn_cancel.add_widget(MDLabel(text='ANNULER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
 
-        self.ae_dialog = MDDialog(title='Modifier la fiche' if is_edit else 'Nouveau Tiers', type='custom', content_cls=scroll, buttons=[], size_hint=(0.96, 0.94))
+        btn_save = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.65,
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.0, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=_save,
+        )
+        btn_save.add_widget(MDBoxLayout())
+        btn_save.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        btn_save.add_widget(MDLabel(text='ENREGISTRER', bold=True, font_size='15sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_save.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_cancel)
+        btns.add_widget(btn_save)
+        wrapper.add_widget(btns)
+
+        self.ae_dialog = MDDialog(
+            title=dlg_title,
+            type='custom',
+            content_cls=wrapper,
+            size_hint=(0.95, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.ae_dialog.open()
         Clock.schedule_once(lambda dt: setattr(f_name, 'focus', True), 0.3)
 
     def show_price_cat_selector(self, tf):
-        content = MDBoxLayout(orientation='vertical', spacing=10, size_hint_y=None, height=dp(160), padding=dp(10))
-        for cat, col in ((AppConstants.PRICE_CAT_DETAIL, (0, 0.6, 0.6, 1)), (AppConstants.PRICE_CAT_SEMI, (0.9, 0.6, 0, 1)), (AppConstants.PRICE_CAT_GROS, (0.5, 0, 0.5, 1))):
-            content.add_widget(MDRaisedButton(text=cat, size_hint_x=1, md_bg_color=col, on_release=lambda x, v=cat: [setattr(tf, 'text', v), self.cat_dialog.dismiss()]))
-        self.cat_dialog = MDDialog(title='Catégorie de Prix', type='custom', content_cls=content, size_hint=(0.8, None))
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=[dp(4), dp(6), dp(4), dp(4)],
+        )
+        for cat, col in (
+            (AppConstants.PRICE_CAT_DETAIL, (0.0, 0.55, 0.58, 1)),
+            (AppConstants.PRICE_CAT_SEMI, (0.9, 0.52, 0.0, 1)),
+            (AppConstants.PRICE_CAT_GROS, (0.48, 0.1, 0.58, 1)),
+        ):
+            btn = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(46),
+                radius=[12],
+                elevation=1,
+                md_bg_color=col,
+                ripple_behavior=True,
+                spacing=dp(8),
+                on_release=lambda x, v=cat: [setattr(tf, 'text', v), self.cat_dialog.dismiss()],
+            )
+            btn.add_widget(MDBoxLayout())
+            btn.add_widget(MDIcon(icon='tag-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+            btn.add_widget(MDLabel(text=cat, bold=True, font_size='15sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+            btn.add_widget(MDBoxLayout())
+            content.add_widget(btn)
+
+        self.cat_dialog = MDDialog(
+            title='Catégorie de Prix',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.82, None),
+            radius=[18, 18, 18, 18],
+        )
         self.cat_dialog.open()
 
     def confirm_delete_entity(self, entity: dict):
@@ -6445,20 +9364,97 @@ class StockApp(MDApp):
         self.temp_note = getattr(self, 'temp_note', '')
         is_client = self.current_mode in ('client_payment', 'client_pay')
         title = 'Versement Client' if is_client else 'Règlement Fournisseur'
-        theme_col = (0, 0.6, 0.2, 1) if is_client else (0.8, 0.4, 0, 1)
+        theme_col = (0.0, 0.62, 0.25, 1) if is_client else (0.85, 0.42, 0.0, 1)
+        soft_bg = (0.95, 0.99, 0.96, 1) if is_client else (1.0, 0.97, 0.93, 1)
 
-        content = MDBoxLayout(orientation='vertical', spacing='12dp', size_hint_y=None, height=dp(560), padding=[0, '10dp', 0, 0])
-        content.add_widget(MDLabel(text=self.fix_text(self.selected_entity['name']), halign='center', font_style='H5', bold=True, theme_text_color='Primary', adaptive_height=True))
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=[dp(2), dp(6), dp(2), dp(2)],
+        )
+
+        header_box = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True, spacing=dp(2))
+        header_box.add_widget(
+            MDLabel(
+                text=self.fix_text(self.selected_entity['name']),
+                halign='center',
+                font_style='H6',
+                bold=True,
+                theme_text_color='Primary',
+                font_name='ArabicFont',
+                size_hint_y=None,
+                height=dp(28),
+                shorten=True,
+            )
+        )
+        if 'balance' in self.selected_entity:
+            cur_bal = FinancialEngine.to_decimal(self.selected_entity.get('balance', 0))
+            bal_col = (0.82, 0.1, 0.1, 1) if cur_bal > 0 else (0.0, 0.6, 0.2, 1)
+            header_box.add_widget(
+                MDLabel(
+                    text=f'Solde actuel : {FinancialEngine.format_money(cur_bal)}',
+                    halign='center',
+                    font_style='Caption',
+                    bold=True,
+                    theme_text_color='Custom',
+                    text_color=bal_col,
+                    size_hint_y=None,
+                    height=dp(18),
+                )
+            )
+        content.add_widget(header_box)
+
+        val_str = FinancialEngine.format_qty(amount) if amount is not None else ''
+        amount_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            height=dp(92),
+            radius=[14],
+            elevation=0,
+            md_bg_color=soft_bg,
+            line_color=theme_col,
+            line_width=1.3,
+            padding=[dp(14), dp(8), dp(14), dp(8)],
+        )
+        self.txt_simple_amount = NoMenuTextField(
+            text=val_str,
+            hint_text='Montant (DA)',
+            font_size='38sp',
+            halign='center',
+            readonly=True,
+            mode='line',
+            line_color_normal=(0, 0, 0, 0),
+            line_color_focus=(0, 0, 0, 0),
+            pos_hint={'center_y': 0.5},
+        )
+        self.txt_simple_amount.theme_text_color = 'Custom'
+
+        def _sync_amount_color():
+            is_neg = self.txt_simple_amount.text.startswith('-')
+            col = (0.82, 0.1, 0.1, 1) if is_neg else (0.08, 0.1, 0.12, 1)
+            self.txt_simple_amount.text_color_normal = col
+            self.txt_simple_amount.text_color_focus = col
+
+        _sync_amount_color()
+        amount_card.add_widget(self.txt_simple_amount)
+        content.add_widget(amount_card)
 
         def _bkspc(x=None):
             if self.txt_simple_amount.text:
                 self.txt_simple_amount.text = self.txt_simple_amount.text[:-1]
+            _sync_amount_color()
+
+        def _clear_all(x=None):
+            self.txt_simple_amount.text = ''
+            _sync_amount_color()
 
         def _digit(d: str):
             cur = self.txt_simple_amount.text
             if d == '.':
                 if '.' not in cur:
-                    self.txt_simple_amount.text = '0.' if not cur else cur + '.'
+                    self.txt_simple_amount.text = '0.' if not cur else ('-0.' if cur == '-' else cur + '.')
             elif d == '-':
                 self.txt_simple_amount.text = cur[1:] if cur.startswith('-') else '-' + cur
             elif cur == '0':
@@ -6467,37 +9463,117 @@ class StockApp(MDApp):
                 self.txt_simple_amount.text = '-' + d
             else:
                 self.txt_simple_amount.text = cur + d
+            _sync_amount_color()
 
-        val_str = FinancialEngine.format_qty(amount) if amount is not None else ''
-        in_row = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(110), spacing='10dp', padding=[dp(20), 0])
-        self.txt_simple_amount = MDTextField(text=val_str, hint_text='Montant (DA)', font_size='42sp', halign='center', readonly=True, mode='fill', line_color_focus=theme_col, size_hint_x=0.7)
-        self.btn_note_icon = MDIconButton(icon='note-edit-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), md_bg_color=(0, 0.6, 0.2, 1) if self.temp_note else (0.2, 0.2, 0.2, 1), size_hint=(None, None), size=(dp(55), dp(55)), pos_hint={'center_y': 0.5}, on_release=self.open_note_input)
-        in_row.add_widget(self.txt_simple_amount)
-        in_row.add_widget(self.btn_note_icon)
-        in_row.add_widget(MDIconButton(icon='backspace-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), md_bg_color=(0.9, 0.1, 0.1, 1), size_hint=(None, None), size=(dp(55), dp(55)), pos_hint={'center_y': 0.5}, on_release=_bkspc))
-        content.add_widget(in_row)
+        tools_row = MDBoxLayout(orientation='horizontal', size_hint=(1, None), height=dp(42), spacing=dp(8))
+        self.btn_note_icon = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.52,
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0, 0.6, 0.2, 1) if self.temp_note else (0.22, 0.24, 0.28, 1),
+            ripple_behavior=True,
+            padding=[dp(10), 0],
+            spacing=dp(6),
+            on_release=self.open_note_input,
+        )
+        self.btn_note_icon.add_widget(MDIcon(icon='note-edit-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        self.btn_note_icon.add_widget(MDLabel(text='Note', bold=True, font_style='Button', theme_text_color='Custom', text_color=(1, 1, 1, 1), halign='center', valign='middle'))
 
-        grid = MDGridLayout(cols=3, spacing='10dp', size_hint_y=1, padding=[dp(20), dp(10)])
+        btn_clear = MDCard(
+            size_hint_x=0.24,
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=_clear_all,
+        )
+        btn_clear.add_widget(MDLabel(text='C', bold=True, font_size='18sp', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.25, 0.25, 0.3, 1)))
+
+        btn_del = MDCard(
+            size_hint_x=0.24,
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0.9, 0.15, 0.15, 1),
+            ripple_behavior=True,
+            on_release=_bkspc,
+        )
+        btn_del.add_widget(MDIcon(icon='backspace-outline', halign='center', valign='middle', pos_hint={'center_x': 0.5, 'center_y': 0.5}, theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='22sp'))
+
+        tools_row.add_widget(self.btn_note_icon)
+        tools_row.add_widget(btn_clear)
+        tools_row.add_widget(btn_del)
+        content.add_widget(tools_row)
+
+        grid_h = min(dp(236), max(dp(188), Window.height * 0.29))
+        grid = MDGridLayout(cols=3, spacing=dp(8), size_hint=(1, None), height=grid_h)
         for key in ('7', '8', '9', '4', '5', '6', '1', '2', '3', '-', '0', '.'):
             if key == '-':
-                btn = MDCard(md_bg_color=(1, 0.85, 0.85, 1), elevation=1, size_hint=(1, 1), radius=[4], ripple_behavior=True, on_release=lambda x, k=key: _digit(k))
-                fc = MDFloatLayout()
-                cb = MDBoxLayout(orientation='vertical', adaptive_size=True, pos_hint={'center_x': 0.5, 'center_y': 0.5})
-                cb.add_widget(MDIcon(icon='minus-thick', font_size='30sp', halign='center', theme_text_color='Custom', text_color=(0.8, 0, 0, 1)))
-                cb.add_widget(MDLabel(text='Crédit Initial', font_style='Caption', halign='center', theme_text_color='Custom', text_color=(0.8, 0, 0, 1), adaptive_size=True))
-                fc.add_widget(cb)
-                btn.add_widget(fc)
-                grid.add_widget(btn)
+                btn = MDCard(
+                    orientation='vertical',
+                    md_bg_color=(1, 0.89, 0.89, 1),
+                    line_color=(0.92, 0.62, 0.62, 1),
+                    line_width=1,
+                    elevation=1,
+                    radius=[12],
+                    ripple_behavior=True,
+                    padding=[dp(4), dp(4), dp(4), dp(4)],
+                    on_release=lambda x, k=key: _digit(k),
+                )
+                btn.add_widget(MDIcon(icon='minus-thick', font_size='24sp', halign='center', pos_hint={'center_x': 0.5}, theme_text_color='Custom', text_color=(0.8, 0, 0, 1)))
+                btn.add_widget(MDLabel(text='Crédit Initial', font_style='Caption', bold=True, halign='center', theme_text_color='Custom', text_color=(0.8, 0, 0, 1), adaptive_height=True))
             else:
-                grid.add_widget(MDRaisedButton(text=key, md_bg_color=(0.96, 0.96, 0.96, 1), theme_text_color='Custom', text_color=(0.1, 0.1, 0.1, 1), font_size='28sp', elevation=1, size_hint=(1, 1), on_release=lambda x, k=key: _digit(k)))
+                btn = MDCard(
+                    md_bg_color=(0.97, 0.97, 0.98, 1),
+                    line_color=(0.88, 0.89, 0.92, 1),
+                    line_width=1,
+                    elevation=1,
+                    radius=[12],
+                    ripple_behavior=True,
+                    on_release=lambda x, k=key: _digit(k),
+                )
+                btn.add_widget(MDLabel(text=key, halign='center', valign='middle', font_size='25sp', bold=True, theme_text_color='Custom', text_color=(0.12, 0.14, 0.18, 1)))
+            grid.add_widget(btn)
         content.add_widget(grid)
 
-        btns = MDBoxLayout(orientation='horizontal', spacing='10dp', size_hint_y=None, height='70dp', padding=[0, '10dp', 0, 0])
-        btns.add_widget(MDFlatButton(text='ANNULER', theme_text_color='Custom', text_color=(0.5, 0.5, 0.5, 1), size_hint_x=0.25, on_release=lambda x: self.simple_pay_dialog.dismiss()))
-        btns.add_widget(MDRaisedButton(text='VALIDER', md_bg_color=theme_col, text_color=(1, 1, 1, 1), size_hint_x=0.75, size_hint_y=1, font_size='22sp', elevation=3, on_release=self.submit_simple_payment))
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(52), padding=[0, dp(4), 0, 0])
+        btn_cancel = MDCard(
+            size_hint_x=0.34,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.simple_pay_dialog.dismiss(),
+        )
+        btn_cancel.add_widget(MDLabel(text='ANNULER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_valid = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.66,
+            radius=[12],
+            elevation=2,
+            md_bg_color=theme_col,
+            ripple_behavior=True,
+            spacing=dp(8),
+            on_release=self.submit_simple_payment,
+        )
+        btn_valid.add_widget(MDBoxLayout())
+        btn_valid.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='22sp', size_hint_x=None, width=dp(24), pos_hint={'center_y': 0.5}))
+        btn_valid.add_widget(MDLabel(text='VALIDER', bold=True, font_size='17sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_valid.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_cancel)
+        btns.add_widget(btn_valid)
         content.add_widget(btns)
 
-        self.simple_pay_dialog = MDDialog(title=title, type='custom', content_cls=content, size_hint=(0.92, None), buttons=[])
+        self.simple_pay_dialog = MDDialog(
+            title=title,
+            type='custom',
+            content_cls=content,
+            size_hint=(0.94, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.simple_pay_dialog.open()
 
     def open_note_input(self, instance):
@@ -6563,17 +9639,123 @@ class StockApp(MDApp):
 
     def open_entity_history_dialog(self, entity: dict):
         self.history_target_entity = entity
-        content = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(550), spacing=dp(8))
-        tabs = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(40), spacing=dp(4))
-        self.btn_eh_today = MDRaisedButton(text='AUJ.', size_hint_x=0.33, elevation=0, on_release=lambda x: self.filter_entity_history_list('auj'))
-        self.btn_eh_yest = MDRaisedButton(text='HIER', size_hint_x=0.33, elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=lambda x: self.filter_entity_history_list('hier'))
-        self.btn_eh_cal = MDRaisedButton(text='CALENDRIER', size_hint_x=0.34, elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=self._open_entity_hist_date)
-        for b in (self.btn_eh_today, self.btn_eh_yest, self.btn_eh_cal):
-            tabs.add_widget(b)
-        content.add_widget(tabs)
+        self.current_eh_filter = AppConstants.FAM_ALL
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        self.eh_start_date = today_str
+        self.eh_end_date = today_str
+
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(590), Window.height * 0.80),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+
+        filter_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.96, 0.97, 0.99, 1),
+            line_color=(0.88, 0.9, 0.94, 1),
+            line_width=1,
+            padding=dp(8),
+            spacing=dp(8),
+        )
+
+        tabs_wrapper = MDBoxLayout(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=dp(36),
+            spacing=dp(4),
+            adaptive_width=True,
+            pos_hint={'center_x': 0.5},
+        )
+        self.btn_eh_today = MDRaisedButton(text='AUJ', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_entity_history_list('auj'))
+        self.btn_eh_yest = MDRaisedButton(text='HIE', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_entity_history_list('hier'))
+        self.btn_eh_week = MDRaisedButton(text='SEM', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_entity_history_list('semaine'))
+        self.btn_eh_month = MDRaisedButton(text='MOI', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_entity_history_list('mois'))
+        self.btn_eh_cal = MDRaisedButton(text='CAL', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=self._open_entity_hist_date)
+        for b in (self.btn_eh_today, self.btn_eh_yest, self.btn_eh_week, self.btn_eh_month, self.btn_eh_cal):
+            tabs_wrapper.add_widget(b)
+        filter_card.add_widget(tabs_wrapper)
+
+        self.btn_eh_filter = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(38),
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0.22, 0.24, 0.28, 1),
+            ripple_behavior=True,
+            padding=[dp(12), 0],
+            spacing=dp(8),
+            on_release=self.open_entity_history_filter_menu,
+        )
+        self.btn_eh_filter.add_widget(MDIcon(icon='filter-variant', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='18sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+        self.lbl_eh_filter = MDLabel(
+            text='FILTRER PAR TYPE',
+            halign='center',
+            valign='middle',
+            bold=True,
+            font_size='12.5sp',
+            max_lines=1,
+            shorten=True,
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+        )
+        self.btn_eh_filter.add_widget(self.lbl_eh_filter)
+        self.btn_eh_filter.add_widget(MDIcon(icon='chevron-down', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+        filter_card.add_widget(self.btn_eh_filter)
+
+        self.lbl_eh_period = MDLabel(
+            text='',
+            halign='center',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Secondary',
+            size_hint_y=None,
+            height=dp(18),
+        )
+        filter_card.add_widget(self.lbl_eh_period)
+        content.add_widget(filter_card)
+
         self.rv_entity_history = HistoryRecycleView()
+        self.rv_entity_history.size_hint_y = 1
         content.add_widget(self.rv_entity_history)
-        self.entity_hist_dialog = MDDialog(title=self.fix_text(f"Historique : {entity['name']}"), type='custom', content_cls=content, size_hint=(0.95, 0.9))
+
+        btn_close = MDCard(
+            size_hint=(1, None),
+            height=dp(46),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.entity_hist_dialog.dismiss() if getattr(self, 'entity_hist_dialog', None) else None,
+        )
+        btn_close.add_widget(
+            MDLabel(
+                text='FERMER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+        content.add_widget(btn_close)
+
+        self.entity_hist_dialog = MDDialog(
+            title=self.fix_text(f"Historique : {entity['name']}"),
+            type='custom',
+            content_cls=content,
+            size_hint=(0.95, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.entity_hist_dialog.open()
         self.filter_entity_history_list('auj')
 
@@ -6582,35 +9764,146 @@ class StockApp(MDApp):
         dp_dlg.bind(on_save=lambda i, val, dr: self.filter_entity_history_list('custom', dr[0], dr[-1]) if dr else self.filter_entity_history_list('custom', val, val))
         dp_dlg.open()
 
+    def open_entity_history_filter_menu(self, instance):
+        ent = getattr(self, 'history_target_entity', None) or {}
+        is_supplier = ent.get('entity_type') == AppConstants.ENTITY_SUPPLIER
+        if is_supplier:
+            filters = [
+                ('Tout', AppConstants.FAM_ALL),
+                ("Bon d'Achat (BA)", AppConstants.DOC_BA),
+                ('Facture Achat (FF)', AppConstants.DOC_FF),
+                ('Commande (DP)', AppConstants.DOC_DP),
+                ('Retour Fourn. (RF)', AppConstants.DOC_RF),
+                ("Bon d'Entrée (BE)", AppConstants.DOC_BE),
+                ('Règlement Fourn.', AppConstants.DOC_SUPPLIER_PAY),
+            ]
+        elif self.is_seller_mode:
+            filters = [
+                ('Tout', AppConstants.FAM_ALL),
+                ('Bon de Vente (BV)', AppConstants.DOC_BV),
+                ('Retour Client (RC)', AppConstants.DOC_RC),
+                ('Versement Client', AppConstants.DOC_CLIENT_PAY),
+            ]
+        else:
+            filters = [
+                ('Tout', AppConstants.FAM_ALL),
+                ('Bon de Vente (BV)', AppConstants.DOC_BV),
+                ('Facture (FC)', AppConstants.DOC_FC),
+                ('Proforma (FP)', AppConstants.DOC_FP),
+                ('Retour Client (RC)', AppConstants.DOC_RC),
+                ('Bon de Sortie (BS)', AppConstants.DOC_BS),
+                ('Versement Client', AppConstants.DOC_CLIENT_PAY),
+            ]
+
+        cur_code = getattr(self, 'current_eh_filter', AppConstants.FAM_ALL)
+        content = MDBoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, height=min(dp(380), Window.height * 0.65), padding=[dp(2), dp(4), dp(2), dp(2)])
+        scroll = MDScrollView(size_hint_y=1)
+        lst = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(8), padding=[dp(2), dp(2)])
+        for label, code in filters:
+            is_sel = code == cur_code
+            card = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(46),
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.90, 0.95, 1, 1) if is_sel else (0.97, 0.98, 0.99, 1),
+                line_color=(0.1, 0.45, 0.85, 0.6) if is_sel else (0.89, 0.91, 0.94, 1),
+                line_width=1.2 if is_sel else 1,
+                padding=[dp(12), 0],
+                spacing=dp(10),
+                ripple_behavior=True,
+                on_release=lambda x, c=code: self._apply_entity_history_filter(c),
+            )
+            ico_name = 'filter-check' if code == AppConstants.FAM_ALL else AppConstants.DOC_VISUALS.get(code, {}).get('icon', 'file')
+            ico_col = (0.1, 0.45, 0.85, 1) if is_sel else AppConstants.DOC_VISUALS.get(code, {}).get('color', (0.4, 0.45, 0.5, 1))
+            card.add_widget(MDIcon(icon=ico_name, theme_text_color='Custom', text_color=ico_col, font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            card.add_widget(MDLabel(text=label, font_style='Subtitle2', bold=True, theme_text_color='Custom', text_color=(0.08, 0.35, 0.72, 1) if is_sel else (0.15, 0.17, 0.22, 1), valign='middle', shorten=True))
+            if is_sel:
+                card.add_widget(MDIcon(icon='check-circle', theme_text_color='Custom', text_color=(0.1, 0.45, 0.85, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            lst.add_widget(card)
+        scroll.add_widget(lst)
+        content.add_widget(scroll)
+        btn_close = MDCard(size_hint=(1, None), height=dp(44), radius=[12], elevation=0, md_bg_color=(0.92, 0.93, 0.95, 1), ripple_behavior=True, on_release=lambda *a: self.hist_filter_dialog.dismiss() if getattr(self, 'hist_filter_dialog', None) else None)
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+        content.add_widget(btn_close)
+        self.hist_filter_dialog = MDDialog(title='Filtrer par type', type='custom', content_cls=content, size_hint=(0.88, None), radius=[18, 18, 18, 18], buttons=[])
+        self.hist_filter_dialog.open()
+
+    def _apply_entity_history_filter(self, code: str):
+        self.current_eh_filter = code
+        if getattr(self, 'hist_filter_dialog', None):
+            self.hist_filter_dialog.dismiss()
+        if getattr(self, 'btn_eh_filter', None) and getattr(self, 'lbl_eh_filter', None):
+            if code == AppConstants.FAM_ALL:
+                self.btn_eh_filter.md_bg_color = (0.22, 0.24, 0.28, 1)
+                self.lbl_eh_filter.text = 'FILTRER PAR TYPE'
+            else:
+                self.btn_eh_filter.md_bg_color = (0, 0.55, 0.8, 1)
+                self.lbl_eh_filter.text = f'FILTRE : {code}'
+        self._reload_entity_history_ui()
+
     def filter_entity_history_list(self, ftype: str = 'auj', start_d=None, end_d=None):
         if not hasattr(self, 'rv_entity_history') or not getattr(self, 'history_target_entity', None):
             return
         inact, act = (0.5, 0.5, 0.5, 1), self.theme_cls.primary_color
-        for b in (self.btn_eh_today, self.btn_eh_yest, self.btn_eh_cal):
+        for b in (self.btn_eh_today, self.btn_eh_yest, self.btn_eh_week, self.btn_eh_month, self.btn_eh_cal):
             b.md_bg_color = inact
         today = datetime.now().date()
         if ftype == 'custom' and start_d:
             s_d, e_d = start_d, (end_d or start_d)
             self.btn_eh_cal.md_bg_color = act
-            self.btn_eh_cal.text = s_d.strftime('%d/%m') if s_d == e_d else 'PÉRIODE'
-        elif ftype == 'hier':
-            s_d = e_d = today - timedelta(days=1)
-            self.btn_eh_yest.md_bg_color = act
-            self.btn_eh_cal.text = 'CALENDRIER'
+            self.btn_eh_cal.text = s_d.strftime('%d/%m') if s_d == e_d else 'CAL'
         else:
-            s_d = e_d = today
-            self.btn_eh_today.md_bg_color = act
-            self.btn_eh_cal.text = 'CALENDRIER'
+            self.btn_eh_cal.text = 'CAL'
+            if ftype == 'hier':
+                s_d = e_d = today - timedelta(days=1)
+                self.btn_eh_yest.md_bg_color = act
+            elif ftype == 'semaine':
+                s_d = today - timedelta(days=(today.weekday() + 2) % 7)
+                e_d = today
+                self.btn_eh_week.md_bg_color = act
+            elif ftype == 'mois':
+                s_d = today.replace(day=1)
+                e_d = today
+                self.btn_eh_month.md_bg_color = act
+            else:
+                s_d = e_d = today
+                self.btn_eh_today.md_bg_color = act
 
+        self.eh_start_date = str(s_d)
+        self.eh_end_date = str(e_d)
+        if getattr(self, 'lbl_eh_period', None):
+            if s_d == e_d:
+                self.lbl_eh_period.text = f"Date : {s_d.strftime('%d/%m/%Y')}"
+            else:
+                self.lbl_eh_period.text = f"Du {s_d.strftime('%d/%m/%Y')} au {e_d.strftime('%d/%m/%Y')}"
+        self._reload_entity_history_ui()
+
+    def _reload_entity_history_ui(self):
+        if not hasattr(self, 'rv_entity_history') or not getattr(self, 'history_target_entity', None):
+            return
+        cur_f = getattr(self, 'current_eh_filter', AppConstants.FAM_ALL)
+        if self.is_seller_mode and cur_f == AppConstants.FAM_ALL:
+            cur_f = 'SELLER_ONLY'
         rows = self.db.get_operations_history(
-            str(s_d),
-            str(e_d),
+            self.eh_start_date,
+            self.eh_end_date,
             entity_id=self.history_target_entity['id'],
             entity_category=self.history_target_entity.get('entity_type'),
-            limit=100,
+            doc_type_filter=cur_f,
+            limit=200,
             offset=0,
         )
-        self.rv_entity_history.data = self._format_history_rows(rows)
+        formatted = self._format_history_rows(rows)
+        if not formatted:
+            formatted = [{
+                'type_str': 'Information', 'ref_str': '', 'entity_str': 'Aucune opération trouvée.',
+                'date_str': '', 'amount_text': '', 'icon': 'information-outline',
+                'icon_color': [0.5, 0.5, 0.5, 1], 'bg_color': [1, 1, 1, 1],
+                'op_id': None, 'is_transfer': False,
+            }]
+        self.rv_entity_history.data = formatted
         self.rv_entity_history.refresh_from_data()
 
     # --------------------------------------------------------------------------
@@ -6623,62 +9916,179 @@ class StockApp(MDApp):
             except Exception:
                 pass
         self.editing_expense_id = edit_data['id'] if edit_data else None
-        content = MDBoxLayout(orientation='vertical', spacing=dp(16), size_hint_y=None, height=dp(290), padding=[dp(10), dp(16), dp(10), 0])
-        self.exp_amount_field = MDTextField(hint_text='Montant (DA)', input_filter='float', font_size='24sp', icon_left='cash', text=str(edit_data['amount']) if edit_data else '')
-        self.exp_cat_field = MDTextField(hint_text='Catégorie', text=edit_data['category'] if edit_data else 'Autre', readonly=True, icon_right='menu-down', icon_left='tag')
-        self.exp_desc_field = SmartTextField(hint_text='Description / Note', text=edit_data['description'] if edit_data else '')
+        is_edit = edit_data is not None
 
-        def _open_cat_menu(inst, touch):
-            if inst.collide_point(*touch.pos):
-                scroll_cat = MDScrollView(size_hint_y=None, height=dp(320))
-                cat_list = MDList()
-                for c in AppConstants.EXPENSE_CATEGORIES:
-                    cat_list.add_widget(
-                        OneLineListItem(
-                            text=c,
-                            on_release=lambda x, val=c: [setattr(self.exp_cat_field, 'text', val), c_dlg.dismiss()],
-                        )
-                    )
-                scroll_cat.add_widget(cat_list)
-                c_dlg = MDDialog(
-                    title='Catégorie de dépense',
-                    type='custom',
-                    content_cls=scroll_cat,
-                    size_hint=(0.85, None),
-                )
-                c_dlg.open()
-                return True
-            return False
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(12),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=[dp(2), dp(6), dp(2), dp(2)],
+        )
 
-        self.exp_cat_field.bind(on_touch_down=_open_cat_menu)
-        content.add_widget(self.exp_amount_field)
-        content.add_widget(self.exp_cat_field)
-        content.add_widget(self.exp_desc_field)
-
-        if not edit_data:
-            content.add_widget(
-                MDFillRoundFlatIconButton(
-                    text="VOIR L'HISTORIQUE",
-                    icon='history',
-                    md_bg_color=(0, 0, 0, 0),
-                    theme_text_color='Custom',
-                    text_color=self.theme_cls.primary_color,
-                    icon_color=self.theme_cls.primary_color,
-                    pos_hint={'center_x': 0.5},
-                    on_release=lambda x: [self.expense_dialog.dismiss(), self.open_expense_history_dialog()],
-                )
+        amt_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            height=dp(88),
+            radius=[14],
+            elevation=0,
+            md_bg_color=(1, 0.96, 0.96, 1),
+            line_color=(0.85, 0.22, 0.22, 1),
+            line_width=1.2,
+            padding=[dp(14), dp(8), dp(14), dp(6)],
+            spacing=dp(2),
+        )
+        amt_card.add_widget(
+            MDLabel(
+                text='MONTANT DE LA DÉPENSE (DA)',
+                font_style='Caption',
+                bold=True,
+                halign='center',
+                theme_text_color='Custom',
+                text_color=(0.78, 0.15, 0.15, 1),
+                size_hint_y=None,
+                height=dp(16),
             )
+        )
+        self.exp_amount_field = MDTextField(
+            hint_text='0.00',
+            input_filter='float',
+            font_size='32sp',
+            halign='center',
+            mode='line',
+            line_color_normal=(0, 0, 0, 0),
+            line_color_focus=(0, 0, 0, 0),
+            text=str(edit_data['amount']) if is_edit else '',
+        )
+        self.exp_amount_field.theme_text_color = 'Custom'
+        self.exp_amount_field.text_color_normal = (0.1, 0.1, 0.12, 1)
+        self.exp_amount_field.text_color_focus = (0.1, 0.1, 0.12, 1)
+        amt_card.add_widget(self.exp_amount_field)
+        content.add_widget(amt_card)
+
+        def _open_cat_picker(*args):
+            scroll_cat = MDScrollView(size_hint_y=None, height=dp(320))
+            cat_list = MDList()
+            for c in AppConstants.EXPENSE_CATEGORIES:
+                cat_list.add_widget(
+                    OneLineListItem(
+                        text=c,
+                        on_release=lambda x, val=c: [setattr(self.exp_cat_field, 'text', val), c_dlg.dismiss()],
+                    )
+                )
+            scroll_cat.add_widget(cat_list)
+            c_dlg = MDDialog(
+                title='Catégorie de dépense',
+                type='custom',
+                content_cls=scroll_cat,
+                size_hint=(0.85, None),
+            )
+            c_dlg.open()
+
+        cat_card = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(58),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.95, 0.97, 1, 1),
+            line_color=(0.84, 0.88, 0.95, 1),
+            line_width=1,
+            padding=[dp(12), 0, dp(10), 0],
+            spacing=dp(10),
+            ripple_behavior=True,
+            on_release=_open_cat_picker,
+        )
+        cat_card.add_widget(MDIcon(icon='tag-outline', theme_text_color='Custom', text_color=self.theme_cls.primary_color, font_size='22sp', size_hint_x=None, width=dp(24), pos_hint={'center_y': 0.5}))
+        self.exp_cat_field = MDTextField(
+            hint_text='Catégorie',
+            text=edit_data['category'] if is_edit else 'Autre',
+            readonly=True,
+            mode='line',
+            line_color_normal=(0, 0, 0, 0),
+            line_color_focus=(0, 0, 0, 0),
+            pos_hint={'center_y': 0.5},
+        )
+        self.exp_cat_field.bind(on_touch_down=lambda inst, t: (_open_cat_picker(), True)[1] if inst.collide_point(*t.pos) else False)
+        cat_card.add_widget(self.exp_cat_field)
+        cat_card.add_widget(MDIcon(icon='menu-down', theme_text_color='Secondary', font_size='24sp', size_hint_x=None, width=dp(24), pos_hint={'center_y': 0.5}))
+        content.add_widget(cat_card)
+
+        desc_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            height=dp(66),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.97, 0.97, 0.98, 1),
+            line_color=(0.88, 0.89, 0.92, 1),
+            line_width=1,
+            padding=[dp(12), dp(4), dp(12), dp(4)],
+        )
+        self.exp_desc_field = SmartTextField(
+            hint_text='Description / Note (optionnel)',
+            text=edit_data['description'] if is_edit else '',
+            icon_right='note-text-outline',
+            pos_hint={'center_y': 0.5},
+        )
+        desc_card.add_widget(self.exp_desc_field)
+        content.add_widget(desc_card)
+
+        if not is_edit:
+            hist_card = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(44),
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.91, 0.95, 1, 1),
+                ripple_behavior=True,
+                spacing=dp(8),
+                on_release=lambda x: [self.expense_dialog.dismiss(), self.open_expense_history_dialog()],
+            )
+            hist_card.add_widget(MDBoxLayout())
+            hist_card.add_widget(MDIcon(icon='history', theme_text_color='Custom', text_color=self.theme_cls.primary_color, font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            hist_card.add_widget(MDLabel(text="VOIR L'HISTORIQUE", bold=True, font_style='Button', theme_text_color='Custom', text_color=self.theme_cls.primary_color, adaptive_width=True, pos_hint={'center_y': 0.5}))
+            hist_card.add_widget(MDBoxLayout())
+            content.add_widget(hist_card)
+
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(50), padding=[0, dp(4), 0, 0])
+        btn_cancel = MDCard(
+            size_hint_x=0.35,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.expense_dialog.dismiss(),
+        )
+        btn_cancel.add_widget(MDLabel(text='ANNULER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_save = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.65,
+            radius=[12],
+            elevation=2,
+            md_bg_color=(0.0, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=self.submit_expense,
+        )
+        btn_save.add_widget(MDBoxLayout())
+        btn_save.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        btn_save.add_widget(MDLabel(text='ENREGISTRER', bold=True, font_size='15sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_save.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_cancel)
+        btns.add_widget(btn_save)
+        content.add_widget(btns)
 
         self.expense_dialog = MDDialog(
-            title='Modifier la dépense' if edit_data else 'Nouvelle Dépense',
+            title='Modifier la dépense' if is_edit else 'Nouvelle Dépense',
             type='custom',
             content_cls=content,
-            size_hint=(0.9, None),
-            radius=[16, 16, 16, 16],
-            buttons=[
-                MDFlatButton(text='ANNULER', theme_text_color='Error', on_release=lambda x: self.expense_dialog.dismiss()),
-                MDRaisedButton(text='ENREGISTRER', md_bg_color=(0, 0.65, 0.25, 1), on_release=self.submit_expense),
-            ],
+            size_hint=(0.94, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
         )
         self.expense_dialog.open()
 
@@ -6707,78 +10117,392 @@ class StockApp(MDApp):
             except Exception:
                 pass
         today_str = datetime.now().strftime('%Y-%m-%d')
-        if not hasattr(self, 'exp_start_date'):
-            self.exp_start_date = today_str
-            self.exp_end_date = today_str
+        self.exp_start_date = today_str
+        self.exp_end_date = today_str
+        self.current_exp_category = AppConstants.FAM_ALL
 
-        content = MDBoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, height=dp(520))
-        frow = MDBoxLayout(orientation='horizontal', spacing=dp(5), size_hint_y=None, height=dp(45))
-        self.btn_exp_start = MDFlatButton(text=self.exp_start_date, md_bg_color=(0.9, 0.9, 0.9, 1), size_hint_x=0.42, on_release=lambda x: self._pick_exp_date('start'))
-        self.btn_exp_end = MDFlatButton(text=self.exp_end_date, md_bg_color=(0.9, 0.9, 0.9, 1), size_hint_x=0.42, on_release=lambda x: self._pick_exp_date('end'))
-        frow.add_widget(self.btn_exp_start)
-        frow.add_widget(MDLabel(text='Au', halign='center', size_hint_x=0.16, bold=True))
-        frow.add_widget(self.btn_exp_end)
-        content.add_widget(frow)
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(570), Window.height * 0.78),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+
+        filter_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.96, 0.97, 0.99, 1),
+            line_color=(0.88, 0.9, 0.94, 1),
+            line_width=1,
+            padding=dp(8),
+            spacing=dp(8),
+        )
+
+        tabs_wrapper = MDBoxLayout(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=dp(36),
+            spacing=dp(4),
+            adaptive_width=True,
+            pos_hint={'center_x': 0.5},
+        )
+        self.btn_exp_today = MDRaisedButton(text='AUJ', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_expenses_list('auj'))
+        self.btn_exp_yest = MDRaisedButton(text='HIE', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_expenses_list('hier'))
+        self.btn_exp_week = MDRaisedButton(text='SEM', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_expenses_list('semaine'))
+        self.btn_exp_month = MDRaisedButton(text='MOI', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_expenses_list('mois'))
+        self.btn_exp_date = MDRaisedButton(text='CAL', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=self.open_expense_date_picker)
+        for b in (self.btn_exp_today, self.btn_exp_yest, self.btn_exp_week, self.btn_exp_month, self.btn_exp_date):
+            tabs_wrapper.add_widget(b)
+        filter_card.add_widget(tabs_wrapper)
+
+        self.btn_exp_filter = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(38),
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0.22, 0.24, 0.28, 1),
+            ripple_behavior=True,
+            padding=[dp(12), 0],
+            spacing=dp(8),
+            on_release=self.open_expense_filter_menu,
+        )
+        self.btn_exp_filter.add_widget(MDIcon(icon='filter-variant', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='18sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+        self.lbl_exp_filter = MDLabel(
+            text='FILTRER PAR CATÉGORIE',
+            halign='center',
+            valign='middle',
+            bold=True,
+            font_size='13sp',
+            theme_text_color='Custom',
+            text_color=(1, 1, 1, 1),
+        )
+        self.btn_exp_filter.add_widget(self.lbl_exp_filter)
+        self.btn_exp_filter.add_widget(MDIcon(icon='chevron-down', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+        filter_card.add_widget(self.btn_exp_filter)
+
+        self.lbl_exp_period = MDLabel(
+            text='',
+            halign='center',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Secondary',
+            size_hint_y=None,
+            height=dp(18),
+        )
+        filter_card.add_widget(self.lbl_exp_period)
+        content.add_widget(filter_card)
 
         scroll = MDScrollView(size_hint_y=1)
-        self.exp_list_layout = MDBoxLayout(orientation='vertical', spacing=dp(8), adaptive_height=True, padding=[dp(2), dp(8)])
+        self.exp_list_layout = MDBoxLayout(orientation='vertical', spacing=dp(8), adaptive_height=True, padding=[dp(2), dp(4)])
         scroll.add_widget(self.exp_list_layout)
         content.add_widget(scroll)
 
-        self.lbl_exp_total = MDLabel(text='TOTAL : 0,00 DA', bold=True, font_style='H6', theme_text_color='Error', halign='right', size_hint_y=None, height=dp(30))
-        content.add_widget(self.lbl_exp_total)
+        total_card = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(46),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(1, 0.95, 0.95, 1),
+            line_color=(0.92, 0.72, 0.72, 1),
+            line_width=1,
+            padding=[dp(14), 0],
+        )
+        total_card.add_widget(
+            MDLabel(
+                text='TOTAL DÉPENSES',
+                font_style='Caption',
+                bold=True,
+                theme_text_color='Custom',
+                text_color=(0.75, 0.15, 0.15, 1),
+                valign='middle',
+                size_hint_x=0.45,
+            )
+        )
+        self.lbl_exp_total = MDLabel(
+            text='0,00 DA',
+            bold=True,
+            font_style='H6',
+            theme_text_color='Custom',
+            text_color=(0.82, 0.1, 0.1, 1),
+            halign='right',
+            valign='middle',
+            size_hint_x=0.55,
+        )
+        total_card.add_widget(self.lbl_exp_total)
+        content.add_widget(total_card)
+
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(48))
+        btn_close = MDCard(
+            size_hint_x=0.38,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.history_exp_dialog.dismiss(),
+        )
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_new = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.62,
+            radius=[12],
+            elevation=1,
+            md_bg_color=self.theme_cls.primary_color,
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=lambda x: [self.history_exp_dialog.dismiss(), self.open_add_expense_dialog()],
+        )
+        btn_new.add_widget(MDBoxLayout())
+        btn_new.add_widget(MDIcon(icon='plus-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        btn_new.add_widget(MDLabel(text='NOUVELLE', bold=True, font_size='14sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_new.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_close)
+        btns.add_widget(btn_new)
+        content.add_widget(btns)
 
         self.history_exp_dialog = MDDialog(
             title='Historique des dépenses',
             type='custom',
             content_cls=content,
             size_hint=(0.95, None),
-            radius=[16, 16, 16, 16],
-            buttons=[
-                MDFlatButton(text='+ NOUVELLE', theme_text_color='Primary', on_release=lambda x: [self.history_exp_dialog.dismiss(), self.open_add_expense_dialog()]),
-                MDRaisedButton(text='FERMER', md_bg_color=(0.2, 0.2, 0.2, 1), on_release=lambda x: self.history_exp_dialog.dismiss()),
-            ],
+            radius=[18, 18, 18, 18],
+            buttons=[],
         )
         self.history_exp_dialog.open()
-        self._load_expenses_ui()
+        self.filter_expenses_list('auj')
 
-    def _pick_exp_date(self, target: str):
-        dp_dlg = MDDatePicker()
-        dp_dlg.bind(on_save=lambda inst, val, dr: self._on_exp_date_saved(val, target))
+    def open_expense_date_picker(self, instance):
+        dp_dlg = MDDatePicker(mode='range')
+        dp_dlg.bind(on_save=lambda inst, val, dr: self.filter_expenses_list('custom', dr[0], dr[-1]) if dr else self.filter_expenses_list('custom', val, val))
         dp_dlg.open()
 
-    def _on_exp_date_saved(self, val, target: str):
-        if target == 'start':
-            self.exp_start_date = str(val)
-            self.btn_exp_start.text = str(val)
+    def filter_expenses_list(self, ftype: str = 'auj', start_d=None, end_d=None):
+        inact, act = (0.5, 0.5, 0.5, 1), self.theme_cls.primary_color
+        for b in (self.btn_exp_today, self.btn_exp_yest, self.btn_exp_week, self.btn_exp_month, self.btn_exp_date):
+            b.md_bg_color = inact
+        today = datetime.now().date()
+        if ftype == 'custom' and start_d:
+            s_d = start_d
+            e_d = end_d or start_d
+            self.btn_exp_date.md_bg_color = act
+            self.btn_exp_date.text = s_d.strftime('%d/%m') if s_d == e_d else 'CAL'
         else:
-            self.exp_end_date = str(val)
-            self.btn_exp_end.text = str(val)
+            self.btn_exp_date.text = 'CAL'
+            if ftype == 'hier':
+                s_d = e_d = today - timedelta(days=1)
+                self.btn_exp_yest.md_bg_color = act
+            elif ftype == 'semaine':
+                s_d = today - timedelta(days=(today.weekday() + 2) % 7)
+                e_d = today
+                self.btn_exp_week.md_bg_color = act
+            elif ftype == 'mois':
+                s_d = today.replace(day=1)
+                e_d = today
+                self.btn_exp_month.md_bg_color = act
+            else:
+                s_d = e_d = today
+                self.btn_exp_today.md_bg_color = act
+
+        self.exp_start_date = str(s_d)
+        self.exp_end_date = str(e_d)
+        if getattr(self, 'lbl_exp_period', None):
+            if s_d == e_d:
+                self.lbl_exp_period.text = f"Date : {s_d.strftime('%d/%m/%Y')}"
+            else:
+                self.lbl_exp_period.text = f"Du {s_d.strftime('%d/%m/%Y')} au {e_d.strftime('%d/%m/%Y')}"
+        self._load_expenses_ui()
+
+    def open_expense_filter_menu(self, instance):
+        filters = [('Tout', AppConstants.FAM_ALL)] + [(c, c) for c in AppConstants.EXPENSE_CATEGORIES]
+        cur_cat = getattr(self, 'current_exp_category', AppConstants.FAM_ALL)
+        content = MDBoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, height=min(dp(400), Window.height * 0.68), padding=[dp(2), dp(4), dp(2), dp(2)])
+        scroll = MDScrollView(size_hint_y=1)
+        lst = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(8), padding=[dp(2), dp(2)])
+        for label, code in filters:
+            is_sel = code == cur_cat
+            card = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(46),
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.90, 0.95, 1, 1) if is_sel else (0.97, 0.98, 0.99, 1),
+                line_color=(0.1, 0.45, 0.85, 0.6) if is_sel else (0.89, 0.91, 0.94, 1),
+                line_width=1.2 if is_sel else 1,
+                padding=[dp(12), 0],
+                spacing=dp(10),
+                ripple_behavior=True,
+                on_release=lambda x, c=code: self._apply_expense_filter(c),
+            )
+            card.add_widget(MDIcon(icon='filter-check' if code == AppConstants.FAM_ALL else 'tag-outline', theme_text_color='Custom', text_color=(0.1, 0.45, 0.85, 1) if is_sel else (0.45, 0.48, 0.55, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            card.add_widget(MDLabel(text=label, font_style='Subtitle2', bold=True, theme_text_color='Custom', text_color=(0.08, 0.35, 0.72, 1) if is_sel else (0.15, 0.17, 0.22, 1), valign='middle', shorten=True))
+            if is_sel:
+                card.add_widget(MDIcon(icon='check-circle', theme_text_color='Custom', text_color=(0.1, 0.45, 0.85, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            lst.add_widget(card)
+        scroll.add_widget(lst)
+        content.add_widget(scroll)
+        btn_close = MDCard(size_hint=(1, None), height=dp(44), radius=[12], elevation=0, md_bg_color=(0.92, 0.93, 0.95, 1), ripple_behavior=True, on_release=lambda *a: self.hist_filter_dialog.dismiss() if getattr(self, 'hist_filter_dialog', None) else None)
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+        content.add_widget(btn_close)
+        self.hist_filter_dialog = MDDialog(title='Filtrer par catégorie', type='custom', content_cls=content, size_hint=(0.88, None), radius=[18, 18, 18, 18], buttons=[])
+        self.hist_filter_dialog.open()
+
+    def _apply_expense_filter(self, code: str):
+        self.current_exp_category = code
+        if getattr(self, 'hist_filter_dialog', None):
+            self.hist_filter_dialog.dismiss()
+        if getattr(self, 'btn_exp_filter', None) and getattr(self, 'lbl_exp_filter', None):
+            if code == AppConstants.FAM_ALL:
+                self.btn_exp_filter.md_bg_color = (0.22, 0.24, 0.28, 1)
+                self.lbl_exp_filter.text = 'FILTRER PAR CATÉGORIE'
+            else:
+                self.btn_exp_filter.md_bg_color = (0, 0.55, 0.8, 1)
+                self.lbl_exp_filter.text = f'FILTRE : {code}'
         self._load_expenses_ui()
 
     def _load_expenses_ui(self):
         self.exp_list_layout.clear_widgets()
         rows = self.db.get_expenses(self.exp_start_date, self.exp_end_date)
+        cat_filter = getattr(self, 'current_exp_category', AppConstants.FAM_ALL)
+        if cat_filter != AppConstants.FAM_ALL:
+            rows = [r for r in rows if r.get('category') == cat_filter]
+
         total = Decimal('0.00')
         for item in rows:
             amt = FinancialEngine.to_decimal(item.get('amount', 0))
             total += amt
-            card = MDCard(orientation='horizontal', padding=dp(10), spacing=dp(8), size_hint_y=None, height=dp(82), radius=[12], md_bg_color=(1, 1, 1, 1), elevation=1)
-            card.add_widget(MDIcon(icon='cash-minus', theme_text_color='Custom', text_color=(0.8, 0.15, 0.15, 1), font_size='28sp', size_hint_x=None, width=dp(36), pos_hint={'center_y': 0.5}))
-            info = MDBoxLayout(orientation='vertical', size_hint_x=1)
-            info.add_widget(MDLabel(text=f"{item['category']} - {FinancialEngine.format_money(amt)}", font_style='Subtitle2', bold=True, theme_text_color='Primary'))
+            card = MDCard(
+                orientation='horizontal',
+                padding=[dp(10), dp(10)],
+                spacing=dp(10),
+                size_hint_y=None,
+                height=dp(82),
+                radius=[12],
+                md_bg_color=(1, 1, 1, 1),
+                line_color=(0.89, 0.91, 0.94, 1),
+                line_width=1,
+                elevation=0,
+            )
+            badge = MDCard(
+                size_hint=(None, None),
+                size=(dp(40), dp(40)),
+                radius=[20],
+                elevation=0,
+                md_bg_color=(1, 0.93, 0.93, 1),
+                pos_hint={'center_y': 0.5},
+            )
+            badge_float = MDFloatLayout()
+            badge_float.add_widget(
+                MDIcon(
+                    icon='cash-minus',
+                    theme_text_color='Custom',
+                    text_color=(0.82, 0.15, 0.15, 1),
+                    font_size='22sp',
+                    size_hint=(None, None),
+                    size=(dp(24), dp(24)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                )
+            )
+            badge.add_widget(badge_float)
+            card.add_widget(badge)
+
+            info = MDBoxLayout(orientation='vertical', size_hint_x=1, spacing=dp(2), pos_hint={'center_y': 0.5})
+            info.add_widget(MDLabel(text=f"{item['category']} • {FinancialEngine.format_money(amt)}", font_style='Subtitle2', bold=True, theme_text_color='Primary', shorten=True))
             info.add_widget(MDLabel(text=self.fix_text(item['description']), font_style='Caption', theme_text_color='Secondary', shorten=True))
             info.add_widget(MDLabel(text=str(item['expense_date'])[:16], font_style='Caption', theme_text_color='Hint'))
             card.add_widget(info)
-            acts = MDBoxLayout(orientation='vertical', size_hint_x=None, width=dp(40))
-            acts.add_widget(MDIconButton(icon='pencil-outline', theme_text_color='Custom', text_color=(0.1, 0.5, 0.8, 1), icon_size='20sp', on_release=lambda x, i=item: [self.history_exp_dialog.dismiss(), self.open_add_expense_dialog(edit_data=i)]))
-            acts.add_widget(MDIconButton(icon='trash-can-outline', theme_text_color='Custom', text_color=(0.8, 0, 0, 1), icon_size='20sp', on_release=lambda x, eid=item['id']: self.confirm_delete_expense(eid)))
+
+            acts = MDBoxLayout(
+                orientation='horizontal',
+                size_hint=(None, None),
+                size=(dp(74), dp(34)),
+                spacing=dp(6),
+                pos_hint={'center_y': 0.5},
+            )
+
+            btn_edit = MDCard(
+                size_hint=(None, None),
+                size=(dp(34), dp(34)),
+                radius=[10],
+                elevation=0,
+                md_bg_color=(0.91, 0.95, 1, 1),
+                ripple_behavior=True,
+                on_release=lambda x, i=item: [self.history_exp_dialog.dismiss(), self.open_add_expense_dialog(edit_data=i)],
+            )
+            e_fl = MDFloatLayout()
+            e_fl.add_widget(
+                MDIcon(
+                    icon='pencil-outline',
+                    theme_text_color='Custom',
+                    text_color=(0.08, 0.45, 0.82, 1),
+                    font_size='18sp',
+                    size_hint=(None, None),
+                    size=(dp(20), dp(20)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                )
+            )
+            btn_edit.add_widget(e_fl)
+
+            btn_del = MDCard(
+                size_hint=(None, None),
+                size=(dp(34), dp(34)),
+                radius=[10],
+                elevation=0,
+                md_bg_color=(1, 0.93, 0.93, 1),
+                ripple_behavior=True,
+                on_release=lambda x, eid=item['id']: self.confirm_delete_expense(eid),
+            )
+            d_fl = MDFloatLayout()
+            d_fl.add_widget(
+                MDIcon(
+                    icon='trash-can-outline',
+                    theme_text_color='Custom',
+                    text_color=(0.82, 0.12, 0.12, 1),
+                    font_size='18sp',
+                    size_hint=(None, None),
+                    size=(dp(20), dp(20)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                )
+            )
+            btn_del.add_widget(d_fl)
+
+            acts.add_widget(btn_edit)
+            acts.add_widget(btn_del)
             card.add_widget(acts)
             self.exp_list_layout.add_widget(card)
 
-        self.lbl_exp_total.text = f'TOTAL : {FinancialEngine.format_money(total)}'
+        self.lbl_exp_total.text = FinancialEngine.format_money(total)
         if not rows:
-            self.exp_list_layout.add_widget(MDLabel(text='Aucune dépense sur cette période.', halign='center', theme_text_color='Hint'))
+            empty_card = MDCard(
+                orientation='vertical',
+                size_hint=(1, None),
+                height=dp(140),
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.98, 0.98, 0.99, 1),
+                line_color=(0.90, 0.91, 0.94, 1),
+                line_width=1,
+                padding=dp(16),
+                spacing=dp(8),
+            )
+            empty_card.add_widget(MDBoxLayout())
+            empty_card.add_widget(MDIcon(icon='receipt-text-outline', theme_text_color='Hint', font_size='38sp', halign='center', pos_hint={'center_x': 0.5}))
+            empty_card.add_widget(MDLabel(text='Aucune dépense sur cette période.', halign='center', font_style='Body2', theme_text_color='Hint', adaptive_height=True))
+            empty_card.add_widget(MDBoxLayout())
+            self.exp_list_layout.add_widget(empty_card)
 
     def confirm_delete_expense(self, exp_id: int):
         def _do_del(x):
@@ -6803,25 +10527,119 @@ class StockApp(MDApp):
     # --------------------------------------------------------------------------
     def show_pending_dialog(self):
         self.current_history_filter = AppConstants.FAM_ALL
-        content = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(580), spacing=dp(8))
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(590), Window.height * 0.80),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
 
-        tabs = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(38), spacing=dp(4))
-        self.btn_hist_today = MDRaisedButton(text='AUJ', size_hint_x=1, font_size='11sp', elevation=0, on_release=lambda x: self.filter_history_list('auj'))
-        self.btn_hist_yest = MDRaisedButton(text='HIE', size_hint_x=1, font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=lambda x: self.filter_history_list('hier'))
-        self.btn_hist_week = MDRaisedButton(text='SEM', size_hint_x=1, font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=lambda x: self.filter_history_list('semaine'))
-        self.btn_hist_month = MDRaisedButton(text='MOI', size_hint_x=1, font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=lambda x: self.filter_history_list('mois'))
-        self.btn_hist_date = MDRaisedButton(text='CAL', size_hint_x=1, font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), on_release=self.open_history_date_picker)
+        filter_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.96, 0.97, 0.99, 1),
+            line_color=(0.88, 0.9, 0.94, 1),
+            line_width=1,
+            padding=dp(8),
+            spacing=dp(8),
+        )
+
+        tabs_wrapper = MDBoxLayout(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=dp(36),
+            spacing=dp(4),
+            adaptive_width=True,
+            pos_hint={'center_x': 0.5},
+        )
+        self.btn_hist_today = MDRaisedButton(text='AUJ', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_history_list('auj'))
+        self.btn_hist_yest = MDRaisedButton(text='HIE', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_history_list('hier'))
+        self.btn_hist_week = MDRaisedButton(text='SEM', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_history_list('semaine'))
+        self.btn_hist_month = MDRaisedButton(text='MOI', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=lambda x: self.filter_history_list('mois'))
+        self.btn_hist_date = MDRaisedButton(text='CAL', size_hint_x=None, width=dp(48), font_size='11sp', elevation=0, md_bg_color=(0.5, 0.5, 0.5, 1), theme_text_color='Custom', text_color=(1, 1, 1, 1), on_release=self.open_history_date_picker)
         for b in (self.btn_hist_today, self.btn_hist_yest, self.btn_hist_week, self.btn_hist_month, self.btn_hist_date):
-            tabs.add_widget(b)
-        content.add_widget(tabs)
+            tabs_wrapper.add_widget(b)
+        filter_card.add_widget(tabs_wrapper)
 
         if not self.is_seller_mode:
-            self.btn_hist_filter = MDRaisedButton(text="FILTRER PAR TYPE D'OPÉRATION", size_hint_x=1, size_hint_y=None, height=dp(40), elevation=0, md_bg_color=(0.2, 0.2, 0.2, 1), on_release=self.open_history_filter_menu)
-            content.add_widget(self.btn_hist_filter)
+            self.btn_hist_filter = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(38),
+                radius=[10],
+                elevation=0,
+                md_bg_color=(0.22, 0.24, 0.28, 1),
+                ripple_behavior=True,
+                padding=[dp(12), 0],
+                spacing=dp(8),
+                on_release=self.open_history_filter_menu,
+            )
+            self.btn_hist_filter.add_widget(MDIcon(icon='filter-variant', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='18sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+            self.lbl_hist_filter = MDLabel(
+                text='FILTRER PAR TYPE',
+                halign='center',
+                valign='middle',
+                bold=True,
+                font_size='12.5sp',
+                max_lines=1,
+                shorten=True,
+                theme_text_color='Custom',
+                text_color=(1, 1, 1, 1),
+            )
+            self.btn_hist_filter.add_widget(self.lbl_hist_filter)
+            self.btn_hist_filter.add_widget(MDIcon(icon='chevron-down', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+            filter_card.add_widget(self.btn_hist_filter)
+
+        self.lbl_hist_period = MDLabel(
+            text='',
+            halign='center',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Secondary',
+            size_hint_y=None,
+            height=dp(18),
+        )
+        filter_card.add_widget(self.lbl_hist_period)
+        content.add_widget(filter_card)
 
         self.rv_history = HistoryRecycleView()
+        self.rv_history.size_hint_y = 1
         content.add_widget(self.rv_history)
-        self.pending_dialog = MDDialog(title='Historique des Opérations', type='custom', content_cls=content, size_hint=(0.98, 0.96))
+
+        btn_close = MDCard(
+            size_hint=(1, None),
+            height=dp(46),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.pending_dialog.dismiss() if getattr(self, 'pending_dialog', None) else None,
+        )
+        btn_close.add_widget(
+            MDLabel(
+                text='FERMER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+        content.add_widget(btn_close)
+
+        self.pending_dialog = MDDialog(
+            title='Historique des Opérations',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.95, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.pending_dialog.open()
         self.filter_history_list('auj')
 
@@ -6843,21 +10661,52 @@ class StockApp(MDApp):
             ('Versement Client', AppConstants.DOC_CLIENT_PAY),
             ('Règlement Fourn.', AppConstants.DOC_SUPPLIER_PAY),
         ]
-        scroll = MDScrollView(size_hint_y=None, height=dp(400))
-        lst = MDList()
+        cur_code = getattr(self, 'current_history_filter', AppConstants.FAM_ALL)
+        content = MDBoxLayout(orientation='vertical', spacing=dp(10), size_hint_y=None, height=min(dp(440), Window.height * 0.72), padding=[dp(2), dp(4), dp(2), dp(2)])
+        scroll = MDScrollView(size_hint_y=1)
+        lst = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(8), padding=[dp(2), dp(2)])
         for label, code in filters:
-            lst.add_widget(OneLineListItem(text=label, on_release=lambda x, c=code: self._apply_history_filter(c)))
+            is_sel = code == cur_code
+            card = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(46),
+                radius=[12],
+                elevation=0,
+                md_bg_color=(0.90, 0.95, 1, 1) if is_sel else (0.97, 0.98, 0.99, 1),
+                line_color=(0.1, 0.45, 0.85, 0.6) if is_sel else (0.89, 0.91, 0.94, 1),
+                line_width=1.2 if is_sel else 1,
+                padding=[dp(12), 0],
+                spacing=dp(10),
+                ripple_behavior=True,
+                on_release=lambda x, c=code: self._apply_history_filter(c),
+            )
+            ico_name = 'filter-check' if code == AppConstants.FAM_ALL else AppConstants.DOC_VISUALS.get(code, {}).get('icon', 'file')
+            ico_col = (0.1, 0.45, 0.85, 1) if is_sel else AppConstants.DOC_VISUALS.get(code, {}).get('color', (0.4, 0.45, 0.5, 1))
+            card.add_widget(MDIcon(icon=ico_name, theme_text_color='Custom', text_color=ico_col, font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            card.add_widget(MDLabel(text=label, font_style='Subtitle2', bold=True, theme_text_color='Custom', text_color=(0.08, 0.35, 0.72, 1) if is_sel else (0.15, 0.17, 0.22, 1), valign='middle', shorten=True))
+            if is_sel:
+                card.add_widget(MDIcon(icon='check-circle', theme_text_color='Custom', text_color=(0.1, 0.45, 0.85, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            lst.add_widget(card)
         scroll.add_widget(lst)
-        self.hist_filter_dialog = MDDialog(title='Filtrer par type', type='custom', content_cls=scroll, size_hint=(0.85, None))
+        content.add_widget(scroll)
+        btn_close = MDCard(size_hint=(1, None), height=dp(44), radius=[12], elevation=0, md_bg_color=(0.92, 0.93, 0.95, 1), ripple_behavior=True, on_release=lambda *a: self.hist_filter_dialog.dismiss() if getattr(self, 'hist_filter_dialog', None) else None)
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+        content.add_widget(btn_close)
+        self.hist_filter_dialog = MDDialog(title='Filtrer par type', type='custom', content_cls=content, size_hint=(0.88, None), radius=[18, 18, 18, 18], buttons=[])
         self.hist_filter_dialog.open()
 
     def _apply_history_filter(self, code: str):
         self.current_history_filter = code
         if getattr(self, 'hist_filter_dialog', None):
             self.hist_filter_dialog.dismiss()
-        if hasattr(self, 'btn_hist_filter'):
-            self.btn_hist_filter.md_bg_color = (0.2, 0.2, 0.2, 1) if code == AppConstants.FAM_ALL else (0, 0.55, 0.8, 1)
-            self.btn_hist_filter.text = "FILTRER PAR TYPE D'OPÉRATION" if code == AppConstants.FAM_ALL else f'FILTRE : {code}'
+        if getattr(self, 'btn_hist_filter', None) and getattr(self, 'lbl_hist_filter', None):
+            if code == AppConstants.FAM_ALL:
+                self.btn_hist_filter.md_bg_color = (0.22, 0.24, 0.28, 1)
+                self.lbl_hist_filter.text = 'FILTRER PAR TYPE'
+            else:
+                self.btn_hist_filter.md_bg_color = (0, 0.55, 0.8, 1)
+                self.lbl_hist_filter.text = f'FILTRE : {code}'
         self.history_page_offset = 0
         self.history_has_more = True
         self.rv_history.data = []
@@ -6895,6 +10744,12 @@ class StockApp(MDApp):
                 self.history_end_date = today
                 self.btn_hist_month.md_bg_color = act
 
+        if getattr(self, 'lbl_hist_period', None):
+            if self.history_start_date == self.history_end_date:
+                self.lbl_hist_period.text = f"Date : {self.history_start_date.strftime('%d/%m/%Y')}"
+            else:
+                self.lbl_hist_period.text = f"Du {self.history_start_date.strftime('%d/%m/%Y')} au {self.history_end_date.strftime('%d/%m/%Y')}"
+
         self.history_page_offset = 0
         self.history_has_more = True
         self.is_loading_history = False
@@ -6911,10 +10766,11 @@ class StockApp(MDApp):
             return
         self.is_loading_history = True
         try:
+            doc_filter = 'SELLER_ONLY' if self.is_seller_mode else self.current_history_filter
             rows = self.db.get_operations_history(
                 str(self.history_start_date),
                 str(self.history_end_date),
-                doc_type_filter=self.current_history_filter,
+                doc_type_filter=doc_filter,
                 limit=self.history_batch_size,
                 offset=self.history_page_offset,
             )
@@ -6992,7 +10848,10 @@ class StockApp(MDApp):
         ent = details['entity']
         items = details['items']
         dt_code = tx['doc_type']
-        vis = AppConstants.DOC_VISUALS.get(dt_code, {'name': dt_code})
+        vis = AppConstants.DOC_VISUALS.get(
+            dt_code,
+            {'name': dt_code, 'icon': 'file-document', 'color': (0.2, 0.3, 0.5, 1), 'bg': (0.96, 0.97, 0.99, 1)},
+        )
 
         ent_cat = tx.get('entity_category', AppConstants.get_entity_type(dt_code))
         is_supp = ent_cat == AppConstants.ENTITY_SUPPLIER
@@ -7001,68 +10860,224 @@ class StockApp(MDApp):
         paid_amt = FinancialEngine.to_decimal(tx.get('paid_amount', 0))
         timbre_val = FinancialEngine.to_decimal(tx.get('stamp_duty', 0))
 
-        content = MDBoxLayout(orientation='vertical', spacing=10, size_hint_y=None, height=dp(550))
-        hbox = MDCard(orientation='vertical', adaptive_height=True, padding=dp(12), md_bg_color=(0.95, 0.96, 0.98, 1), radius=[10], elevation=0)
-        hbox.add_widget(MDLabel(text=self.fix_text(f"{vis['name']} ({tx.get('doc_number', '')})"), bold=True, font_style='Subtitle1', adaptive_height=True))
+        doc_title = vis['name']
+        doc_icon = vis.get('icon', 'file-document')
+        doc_col = vis.get('color', (0.2, 0.3, 0.5, 1))
+        doc_bg = vis.get('bg', (0.96, 0.97, 0.99, 1))
+        if dt_code in (AppConstants.DOC_CLIENT_PAY, AppConstants.DOC_SUPPLIER_PAY) and total_amt < 0:
+            doc_title = 'Dette Initiale' if dt_code == AppConstants.DOC_SUPPLIER_PAY else 'Crédit Initial'
+            doc_icon = 'cash-minus'
+            doc_col = (0.85, 0.1, 0.1, 1)
+            doc_bg = (1, 0.94, 0.94, 1)
+
+        is_today = str(tx.get('date', '')).split(' ')[0] == datetime.now().strftime('%Y-%m-%d')
+        can_edit = (not self.is_seller_mode or is_today) and dt_code != AppConstants.DOC_BI
+        can_del = not self.is_seller_mode or is_today
+
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(600), Window.height * 0.84),
+            padding=[0, 0, 0, dp(2)],
+        )
+
+        top_bar = MDBoxLayout(orientation='horizontal', size_hint=(1, None), height=dp(38), spacing=dp(8))
+        top_bar.add_widget(MDLabel(text='Détails', font_style='H6', bold=True, theme_text_color='Primary', valign='center'))
+        if can_del:
+            btn_top_del = MDCard(
+                size_hint=(None, None),
+                size=(dp(36), dp(36)),
+                radius=[10],
+                elevation=0,
+                md_bg_color=(1, 0.93, 0.93, 1),
+                line_color=(0.94, 0.74, 0.74, 1),
+                line_width=1,
+                ripple_behavior=True,
+                pos_hint={'center_y': 0.5},
+                on_release=lambda x: self.confirm_delete_transaction(op_id, is_transfer),
+            )
+            del_fl = MDFloatLayout()
+            del_fl.add_widget(
+                MDIcon(
+                    icon='trash-can-outline',
+                    theme_text_color='Custom',
+                    text_color=(0.82, 0.12, 0.12, 1),
+                    font_size='19sp',
+                    size_hint=(None, None),
+                    size=(dp(20), dp(20)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                )
+            )
+            btn_top_del.add_widget(del_fl)
+            top_bar.add_widget(btn_top_del)
+        content.add_widget(top_bar)
+
+        hbox = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            padding=dp(12),
+            spacing=dp(6),
+            md_bg_color=doc_bg,
+            line_color=(doc_col[0], doc_col[1], doc_col[2], 0.25),
+            line_width=1,
+            radius=[14],
+            elevation=0,
+        )
+
+        top_info = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(42), spacing=dp(10))
+        ico_badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(40), dp(40)),
+            radius=[20],
+            elevation=0,
+            md_bg_color=(1, 1, 1, 0.9),
+            pos_hint={'center_y': 0.5},
+        )
+        ico_float = MDFloatLayout()
+        ico_float.add_widget(
+            MDIcon(
+                icon=doc_icon,
+                theme_text_color='Custom',
+                text_color=doc_col,
+                size_hint=(None, None),
+                size=(dp(24), dp(24)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                font_size='22sp',
+            )
+        )
+        ico_badge.add_widget(ico_float)
+        top_info.add_widget(ico_badge)
+
+        title_col = MDBoxLayout(orientation='vertical', pos_hint={'center_y': 0.5}, spacing=dp(2))
+        title_col.add_widget(MDLabel(text=self.fix_text(doc_title), bold=True, font_style='Subtitle1', theme_text_color='Primary', adaptive_height=True))
+        ref_str = tx.get('doc_number', '')
+        date_str = str(tx.get('date', ''))[:16]
+        sub_txt = f'{ref_str}  •  {date_str}' if ref_str else date_str
+        title_col.add_widget(MDLabel(text=self.fix_text(sub_txt), font_style='Caption', theme_text_color='Secondary', adaptive_height=True))
+        top_info.add_widget(title_col)
+        hbox.add_widget(top_info)
+
+        hbox.add_widget(MDSeparator(height=dp(1), color=(0, 0, 0, 0.08)))
+
         if is_transfer:
             src = AppConstants.LOC_LABELS.get(tx.get('source_location'), 'Magasin')
             dst = AppConstants.LOC_LABELS.get(tx.get('destination_location'), 'Dépôt')
-            hbox.add_widget(MDLabel(text=f'Trajet : {src} -> {dst}', font_style='Subtitle2', adaptive_height=True))
+            hbox.add_widget(MDLabel(text=f'Trajet : {src}  ->  {dst}', font_style='Subtitle2', bold=True, adaptive_height=True))
         else:
             lbl_e = 'Fournisseur' if is_supp else 'Client'
-            hbox.add_widget(MDLabel(text=f"{lbl_e} : {self.fix_text(ent.get('name', AppConstants.DEFAULT_CLIENT_NAME))}", font_style='Subtitle2', adaptive_height=True))
-        hbox.add_widget(MDLabel(text=f"Date : {str(tx.get('date', ''))[:16]}", font_style='Caption', theme_text_color='Secondary', adaptive_height=True))
+            hbox.add_widget(MDLabel(text=f"{lbl_e} : {self.fix_text(ent.get('name', AppConstants.DEFAULT_CLIENT_NAME))}", font_style='Subtitle2', bold=True, adaptive_height=True))
 
         if not is_transfer and dt_code not in AppConstants.QTY_ONLY_DOC_TYPES:
             if timbre_val > 0:
-                hbox.add_widget(MDLabel(text=f'Droit de Timbre : {FinancialEngine.format_money(timbre_val)}', theme_text_color='Custom', text_color=(0.5, 0, 0.5, 1), font_style='Caption', adaptive_height=True))
-            hbox.add_widget(MDLabel(text=f'Montant : {FinancialEngine.format_money(abs(total_amt))}', bold=True, font_style='H5', adaptive_height=True))
+                hbox.add_widget(MDLabel(text=f'Droit de Timbre : {FinancialEngine.format_money(timbre_val)}', theme_text_color='Custom', text_color=(0.5, 0, 0.5, 1), font_style='Caption', bold=True, adaptive_height=True))
+            hbox.add_widget(MDLabel(text=f'Montant : {FinancialEngine.format_money(abs(total_amt))}', bold=True, font_style='H5', theme_text_color='Custom', text_color=doc_col, adaptive_height=True))
             if AppConstants.FINANCIAL_FACTORS.get(dt_code, 0) == 1 and not is_comptoir:
                 rem = FinancialEngine.quantize_money(total_amt - paid_amt)
                 if abs(rem) < Decimal('0.05'):
-                    hbox.add_widget(MDLabel(text='Statut : Payée', theme_text_color='Custom', text_color=(0, 0.65, 0.2, 1), bold=True, adaptive_height=True))
+                    hbox.add_widget(MDLabel(text='Statut : Payée', theme_text_color='Custom', text_color=(0, 0.62, 0.2, 1), font_style='Subtitle2', bold=True, adaptive_height=True))
                 else:
-                    hbox.add_widget(MDLabel(text=f"{'Règlement' if is_supp else 'Versement'} : {FinancialEngine.format_money(paid_amt)}", theme_text_color='Custom', text_color=(0, 0.6, 0.2, 1), bold=True, adaptive_height=True))
-                    hbox.add_widget(MDLabel(text=f'Reste : {FinancialEngine.format_money(rem)}', theme_text_color='Custom', text_color=(0.85, 0, 0, 1), bold=True, adaptive_height=True))
+                    pay_row = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(22), spacing=dp(8))
+                    pay_row.add_widget(MDLabel(text=f"{'Règlement' if is_supp else 'Versement'} : {FinancialEngine.format_money(paid_amt)}", theme_text_color='Custom', text_color=(0, 0.6, 0.2, 1), font_style='Caption', bold=True))
+                    pay_row.add_widget(MDLabel(text=f'Reste : {FinancialEngine.format_money(rem)}', theme_text_color='Custom', text_color=(0.85, 0, 0, 1), font_style='Caption', bold=True, halign='right'))
+                    hbox.add_widget(pay_row)
         content.add_widget(hbox)
 
-        scroll = MDScrollView()
-        lst = MDList()
+        scroll = MDScrollView(size_hint_y=1)
+        lst = MDList(padding=[0, dp(2)], spacing=dp(4))
         if items:
             for it in items:
                 q_disp = FinancialEngine.format_qty(it['qty'])
-                ib = MDBoxLayout(orientation='vertical', adaptive_height=True, padding=[dp(10), dp(8)], spacing=dp(2))
+                ib = MDBoxLayout(orientation='vertical', adaptive_height=True, padding=[dp(10), dp(8)], spacing=dp(3))
                 ib.add_widget(MDLabel(text=self.fix_text(it['product_name']), font_style='Subtitle1', bold=True, adaptive_height=True))
                 if is_transfer or dt_code in AppConstants.QTY_ONLY_DOC_TYPES:
                     ib.add_widget(MDLabel(text=f'Qté : {q_disp}', theme_text_color='Custom', text_color=(0, 0.4, 0.8, 1), bold=True, adaptive_height=True))
                 else:
                     lc = FinancialEngine.calculate_document_totals([it], doc_type=dt_code)
                     p_disp = FinancialEngine.format_money(it['price'])
-                    ib.add_widget(MDLabel(text=f"{q_disp} x {p_disp} = {FinancialEngine.format_money(lc['final_total'])}", theme_text_color='Secondary', font_style='Body2', adaptive_height=True))
+                    ib.add_widget(MDLabel(text=f"{q_disp} x {p_disp} = {FinancialEngine.format_money(lc['final_total'])}", theme_text_color='Secondary', font_style='Body2', bold=True, adaptive_height=True))
                 lst.add_widget(ib)
-                lst.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.9, 1)))
+                lst.add_widget(MDSeparator(height=dp(1), color=(0.91, 0.92, 0.94, 1)))
         else:
-            lst.add_widget(OneLineListItem(text=f"Note : {self.fix_text(tx.get('note', 'Opération financière'))}"))
+            note_card = MDCard(
+                orientation='horizontal',
+                size_hint=(1, None),
+                height=dp(52),
+                radius=[10],
+                elevation=0,
+                md_bg_color=(0.96, 0.97, 0.98, 1),
+                padding=[dp(12), 0],
+                spacing=dp(10),
+            )
+            note_card.add_widget(MDIcon(icon='note-text-outline', theme_text_color='Secondary', font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            note_card.add_widget(MDLabel(text=f"Note : {self.fix_text(tx.get('note', 'Opération financière'))}", font_style='Body2', bold=True, theme_text_color='Primary', valign='middle'))
+            lst.add_widget(note_card)
         scroll.add_widget(lst)
         content.add_widget(scroll)
 
-        actions = MDBoxLayout(orientation='vertical', spacing='10dp', adaptive_height=True, padding=[0, '10dp', 0, 0])
-        top_row = MDBoxLayout(orientation='horizontal', spacing='10dp', size_hint_y=None, height='48dp')
+        def _make_action_btn(label_txt: str, icon_name: str, bg_col, txt_col, cb, border_col=None):
+            c = MDCard(
+                orientation='horizontal',
+                size_hint_x=1,
+                size_hint_y=None,
+                height=dp(44),
+                radius=[10],
+                elevation=0,
+                md_bg_color=bg_col,
+                ripple_behavior=True,
+                spacing=dp(6),
+                on_release=cb,
+            )
+            if border_col is not None:
+                c.line_color = border_col
+                c.line_width = 1
+            c.add_widget(MDBoxLayout())
+            c.add_widget(MDIcon(icon=icon_name, theme_text_color='Custom', text_color=txt_col, font_size='18sp', size_hint_x=None, width=dp(20), pos_hint={'center_y': 0.5}))
+            c.add_widget(MDLabel(text=label_txt, bold=True, font_size='13.5sp', theme_text_color='Custom', text_color=txt_col, adaptive_width=True, pos_hint={'center_y': 0.5}))
+            c.add_widget(MDBoxLayout())
+            return c
+
+        actions = MDBoxLayout(orientation='vertical', spacing=dp(8), size_hint=(1, None), adaptive_height=True, padding=[0, dp(4), 0, 0])
+
+        export_row = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint=(1, None), height=dp(44))
+        has_export = False
         if dt_code not in AppConstants.INVOICE_TAX_DOC_TYPES:
-            top_row.add_widget(MDFillRoundFlatButton(text='IMPRIMER', md_bg_color=(0, 0.5, 0.8, 1), size_hint_x=1, on_release=lambda x: threading.Thread(target=self.print_ticket_bluetooth, args=(details,), daemon=True).start()))
-        if dt_code not in (AppConstants.DOC_CLIENT_PAY, AppConstants.DOC_SUPPLIER_PAY):
-            top_row.add_widget(MDFillRoundFlatButton(text='PDF A4', md_bg_color=(0.8, 0.2, 0.2, 1), size_hint_x=1, on_release=lambda x: self.generate_pdf_report(op_id, is_transfer)))
+            has_export = True
+            export_row.add_widget(_make_action_btn('IMPRIMER', 'printer', (0.08, 0.45, 0.82, 1), (1, 1, 1, 1), lambda x: threading.Thread(target=self.print_ticket_bluetooth, args=(details,), daemon=True).start()))
+        has_export = True
+        export_row.add_widget(_make_action_btn('PDF A4', 'file-pdf-box', (0.82, 0.2, 0.2, 1), (1, 1, 1, 1), lambda x: self.generate_pdf_report(op_id, is_transfer)))
+        if has_export:
+            actions.add_widget(export_row)
 
-        is_today = str(tx.get('date', '')).split(' ')[0] == datetime.now().strftime('%Y-%m-%d')
-        if (not self.is_seller_mode or is_today) and dt_code != AppConstants.DOC_BI:
-            top_row.add_widget(MDFillRoundFlatButton(text='MODIFIER', md_bg_color=(0, 0.6, 0.4, 1), size_hint_x=1, on_release=lambda x: self.load_transaction_for_edit(details)))
-        actions.add_widget(top_row)
+        if can_edit:
+            actions.add_widget(_make_action_btn('MODIFIER', 'pencil-outline', (0.0, 0.58, 0.38, 1), (1, 1, 1, 1), lambda x: self.load_transaction_for_edit(details)))
 
-        if not self.is_seller_mode or is_today:
-            actions.add_widget(MDFlatButton(text='SUPPRIMER', theme_text_color='Custom', text_color=(0.9, 0, 0, 1), size_hint_x=1, on_release=lambda x: self.confirm_delete_transaction(op_id, is_transfer)))
+        btn_close = MDCard(
+            size_hint=(1, None),
+            height=dp(46),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.srv_dialog.dismiss() if getattr(self, 'srv_dialog', None) else None,
+        )
+        btn_close.add_widget(MDLabel(text='FERMER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+        actions.add_widget(btn_close)
         content.add_widget(actions)
 
-        self.srv_dialog = MDDialog(title='Détails', type='custom', content_cls=content, size_hint=(0.95, 0.95), buttons=[MDFlatButton(text='FERMER', on_release=lambda x: self.srv_dialog.dismiss())])
+        self.srv_dialog = MDDialog(
+            title='',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.94, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.srv_dialog.open()
 
     def load_transaction_for_edit(self, details: dict):
@@ -7142,13 +11157,120 @@ class StockApp(MDApp):
             except Exception as exc:
                 self.notify(str(exc), 'error')
 
-        self.confirm_del_dialog = MDDialog(
-            title='Confirmation',
+        content = MDBoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            adaptive_height=True,
+            spacing=dp(12),
+            padding=[0, 0, 0, dp(2)],
+        )
+
+        badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(56)),
+            radius=[28],
+            elevation=0,
+            md_bg_color=(1, 0.92, 0.92, 1),
+            pos_hint={'center_x': 0.5},
+        )
+        b_fl = MDFloatLayout()
+        b_fl.add_widget(
+            MDIcon(
+                icon='trash-can-outline',
+                theme_text_color='Custom',
+                text_color=(0.82, 0.12, 0.12, 1),
+                font_size='28sp',
+                size_hint=(None, None),
+                size=(dp(30), dp(30)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        badge.add_widget(b_fl)
+        content.add_widget(badge)
+
+        content.add_widget(
+            MDLabel(
+                text='Confirmer la suppression',
+                halign='center',
+                font_style='H6',
+                bold=True,
+                theme_text_color='Custom',
+                text_color=(0.78, 0.12, 0.12, 1),
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+
+        msg_card = MDCard(
+            orientation='vertical',
+            size_hint=(1, None),
+            adaptive_height=True,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(1, 0.95, 0.95, 1),
+            line_color=(0.94, 0.78, 0.78, 1),
+            line_width=1,
+            padding=[dp(14), dp(10)],
+        )
+        lbl_msg = MDLabel(
             text='Voulez-vous vraiment supprimer cette opération ?\nLe stock et le solde seront recalculés automatiquement.',
-            buttons=[
-                MDFlatButton(text='NON', on_release=lambda x: self.confirm_del_dialog.dismiss()),
-                MDRaisedButton(text='OUI, SUPPRIMER', md_bg_color=(0.8, 0, 0, 1), on_release=_do_del),
-            ],
+            halign='center',
+            font_style='Body2',
+            bold=True,
+            theme_text_color='Custom',
+            text_color=(0.25, 0.14, 0.14, 1),
+            size_hint_y=None,
+        )
+        lbl_msg.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(22), val[1])),
+        )
+        msg_card.add_widget(lbl_msg)
+        content.add_widget(msg_card)
+
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(48))
+        btn_no = MDCard(
+            size_hint_x=0.42,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.confirm_del_dialog.dismiss(),
+        )
+        btn_no.add_widget(MDLabel(text='ANNULER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_yes = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.58,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.82, 0.12, 0.12, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=_do_del,
+        )
+        btn_yes.add_widget(MDBoxLayout())
+        btn_yes.add_widget(MDIcon(icon='trash-can-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+        btn_yes.add_widget(MDLabel(text='SUPPRIMER', bold=True, font_size='14.5sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_yes.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_no)
+        btns.add_widget(btn_yes)
+        content.add_widget(btns)
+
+        self.confirm_del_dialog = MDDialog(
+            title='',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.90, None),
+            radius=[20, 20, 20, 20],
+            buttons=[],
         )
         self.confirm_del_dialog.open()
 
@@ -7175,6 +11297,46 @@ class StockApp(MDApp):
             ent_cat = tx.get('entity_category', AppConstants.get_entity_type(dt_code))
             is_supp = ent_cat == AppConstants.ENTITY_SUPPLIER
             is_comptoir = AppConstants.is_default_entity(tx.get('entity_id'), ent_cat)
+            is_financial = dt_code in (AppConstants.DOC_CLIENT_PAY, AppConstants.DOC_SUPPLIER_PAY)
+
+            def _calc_tx_bal_impact(tx_row: dict) -> Decimal:
+                d_code = tx_row['doc_type']
+                t_amt = FinancialEngine.to_decimal(tx_row.get('total_amount', 0))
+                p_amt = FinancialEngine.to_decimal(tx_row.get('paid_amount', 0))
+                ff = AppConstants.FINANCIAL_FACTORS.get(d_code, 0)
+                sf = AppConstants.STOCK_MOVEMENTS.get(d_code, 0)
+                if ff == -1 and sf == 0:
+                    return -t_amt
+                if ff == -1 and sf != 0:
+                    return -t_amt + p_amt
+                return (t_amt * Decimal(ff)) - p_amt
+
+            def _compute_historical_balance() -> dict | None:
+                if is_comptoir or not ent or not tx.get('entity_id'):
+                    return None
+                cur_bal = FinancialEngine.to_decimal(ent.get('balance', 0))
+                conn = self.db.get_connection()
+                try:
+                    later_rows = conn.execute(
+                        '''
+                        SELECT doc_type, total_amount, paid_amount
+                        FROM transactions
+                        WHERE entity_id = ?
+                          AND entity_category = ?
+                          AND (date > ? OR (date = ? AND id > ?))
+                        ''',
+                        (tx['entity_id'], ent_cat, tx['date'], tx['date'], tx['id']),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                later_impact = sum((_calc_tx_bal_impact(dict(lr)) for lr in later_rows), Decimal('0.00'))
+                bal_after = FinancialEngine.quantize_money(cur_bal - later_impact)
+                this_impact = FinancialEngine.quantize_money(_calc_tx_bal_impact(tx))
+                return {
+                    'old_balance': FinancialEngine.quantize_money(bal_after - this_impact),
+                    'transaction_amount': this_impact,
+                    'new_balance': bal_after,
+                }
 
             if is_transfer:
                 src = AppConstants.LOC_LABELS.get(tx.get('source_location'), 'Magasin')
@@ -7201,77 +11363,108 @@ class StockApp(MDApp):
             except Exception:
                 date_str = str(tx.get('date', ''))[:10]
 
-            doc_num = tx.get('doc_number') or f'{dt_code}-{op_id:05d}'
-            pdf.doc_info = {
-                'date': date_str,
-                'doc_name_fr': vis['name'].upper(),
-                'doc_number': doc_num,
-                'payment_method': '' if is_transfer else tx.get('payment_method', ''),
-                'doc_type': dt_code,
-            }
-
-            printable_w = pdf.w - pdf.l_margin - pdf.r_margin
-            table_data = []
-            if dt_code in AppConstants.QTY_ONLY_DOC_TYPES:
-                headers = ['N°', 'Code', 'Désignation', 'Qté']
-                col_widths = [14, 32, printable_w - 76, 30]
-                for i, it in enumerate(items, 1):
-                    table_data.append([str(i), it.get('product_ref') or '', it['product_name'], FinancialEngine.format_qty(it['qty'])])
-                pdf.totals = {}
-                pdf.amount_in_words = ''
-                pdf.payment_info = {}
-                pdf.balance_data = None
-            else:
-                is_bon = dt_code in (AppConstants.DOC_BV, AppConstants.DOC_BA)
-                if is_bon:
-                    headers = ['N°', 'Code', 'Désignation', 'Qté', 'P.U.', 'Remise', 'Total']
-                    col_widths = [10, 24, 0, 15, 25, 20, 26]
+            if is_financial:
+                total_amt = FinancialEngine.to_decimal(tx.get('total_amount', 0))
+                abs_amt = abs(total_amt)
+                if dt_code == AppConstants.DOC_CLIENT_PAY:
+                    fin_title = 'Reçu de Versement' if total_amt >= 0 else 'Crédit Initial'
+                    doc_prefix = 'VER' if total_amt >= 0 else 'CI'
+                    recipient_sig = 'Signature Client'
                 else:
-                    headers = ['N°', 'Code', 'Désignation', 'Qté', 'P.U. HT', 'Remise', 'TVA', 'Total HT']
-                    col_widths = [10, 22, 0, 14, 24, 18, 14, 26]
-                col_widths[2] = max(20, printable_w - sum(w for w in col_widths if w > 0))
+                    fin_title = 'Bon de Règlement' if total_amt >= 0 else 'Dette Initiale'
+                    doc_prefix = 'REG' if total_amt >= 0 else 'DI'
+                    recipient_sig = 'Signature Fournisseur'
 
-                calc = FinancialEngine.calculate_document_totals(
-                    items,
-                    doc_type=dt_code,
-                    global_discount=FinancialEngine.to_decimal(tx.get('global_discount', 0)),
-                    payment_method=tx.get('payment_method', ''),
-                    is_comptoir=is_comptoir,
-                )
-                for i, it in enumerate(items, 1):
-                    q_s = FinancialEngine.format_qty(it['qty'])
-                    p_d = FinancialEngine.to_decimal(it['price'])
-                    d_amt = FinancialEngine.to_decimal(it.get('discount_amount', 0))
-                    u_disc = d_amt if it.get('discount_type') == 'fixed' else p_d * (d_amt / Decimal('100'))
-                    line_ht = FinancialEngine.quantize_money((p_d - u_disc) * FinancialEngine.to_decimal(it['qty']))
-                    row = [str(i), it.get('product_ref') or '', it['product_name'], q_s, FinancialEngine.format_money(p_d, False), FinancialEngine.format_money(d_amt, False)]
-                    if not is_bon:
-                        row.append(f"{float(it.get('tva', 0)):g}%")
-                    row.append(FinancialEngine.format_money(line_ht, False))
-                    table_data.append(row)
-
-                pdf.totals = {
-                    'total_ht': calc['total_ht_final'],
-                    'total_tva': calc['total_tva_final'],
-                    'total_discount': calc['total_all_discounts_final'],
-                    'stamp_duty': calc['stamp_duty'] if calc['stamp_duty'] > 0 else None,
-                    'final_total': calc['final_total'],
+                doc_num = f'{doc_prefix}-{op_id:05d}'
+                pdf.doc_info = {
+                    'date': date_str,
+                    'doc_name_fr': fin_title.upper(),
+                    'doc_number': doc_num,
+                    'payment_method': tx.get('payment_method', ''),
+                    'doc_type': dt_code,
                 }
-                pdf.amount_in_words = f"{FinancialEngine.number_to_words_fr(calc['final_total'])} dinars algériens."
-                pdf.payment_info = {'amount': tx.get('paid_amount', 0)}
+                pdf.amount_in_words = f'{FinancialEngine.number_to_words_fr(abs_amt)} dinars algériens.'
+                pdf.balance_data = _compute_historical_balance()
+                pdf.add_page()
+                pdf.draw_financial_receipt(
+                    fin_title,
+                    str(tx.get('date', ''))[:16],
+                    tx.get('note') or fin_title,
+                    abs_amt,
+                    recipient_sig,
+                )
+                doc_file_prefix = fin_title.replace(' ', '_')
+            else:
+                doc_num = tx.get('doc_number') or f'{dt_code}-{op_id:05d}'
+                pdf.doc_info = {
+                    'date': date_str,
+                    'doc_name_fr': vis['name'].upper(),
+                    'doc_number': doc_num,
+                    'payment_method': '' if is_transfer else tx.get('payment_method', ''),
+                    'doc_type': dt_code,
+                }
 
-                pdf.balance_data = None
-                if self.db.get_bool_setting('show_balance_in_pdf', False) and dt_code in (AppConstants.DOC_BV, AppConstants.DOC_BA) and not is_comptoir and ent:
-                    cur_bal = FinancialEngine.to_decimal(ent.get('balance', 0))
-                    eff = calc['final_total'] - FinancialEngine.to_decimal(tx.get('paid_amount', 0))
-                    pdf.balance_data = {'old_balance': cur_bal - eff, 'transaction_amount': eff, 'new_balance': cur_bal}
+                printable_w = pdf.w - pdf.l_margin - pdf.r_margin
+                table_data = []
+                if dt_code in AppConstants.QTY_ONLY_DOC_TYPES:
+                    headers = ['N°', 'Code', 'Désignation', 'Qté']
+                    col_widths = [14, 32, printable_w - 76, 30]
+                    for i, it in enumerate(items, 1):
+                        table_data.append([str(i), it.get('product_ref') or '', it['product_name'], FinancialEngine.format_qty(it['qty'])])
+                    pdf.totals = {}
+                    pdf.amount_in_words = ''
+                    pdf.payment_info = {}
+                    pdf.balance_data = None
+                else:
+                    is_bon = dt_code in (AppConstants.DOC_BV, AppConstants.DOC_BA)
+                    if is_bon:
+                        headers = ['N°', 'Code', 'Désignation', 'Qté', 'P.U.', 'Remise', 'Total']
+                        col_widths = [10, 24, 0, 15, 25, 20, 26]
+                    else:
+                        headers = ['N°', 'Code', 'Désignation', 'Qté', 'P.U. HT', 'Remise', 'TVA', 'Total HT']
+                        col_widths = [10, 22, 0, 14, 24, 18, 14, 26]
+                    col_widths[2] = max(20, printable_w - sum(w for w in col_widths if w > 0))
 
-            pdf.add_page()
-            pdf.draw_table_with_fill(headers, table_data, col_widths)
+                    calc = FinancialEngine.calculate_document_totals(
+                        items,
+                        doc_type=dt_code,
+                        global_discount=FinancialEngine.to_decimal(tx.get('global_discount', 0)),
+                        payment_method=tx.get('payment_method', ''),
+                        is_comptoir=is_comptoir,
+                    )
+                    for i, it in enumerate(items, 1):
+                        q_s = FinancialEngine.format_qty(it['qty'])
+                        p_d = FinancialEngine.to_decimal(it['price'])
+                        d_amt = FinancialEngine.to_decimal(it.get('discount_amount', 0))
+                        u_disc = d_amt if it.get('discount_type') == 'fixed' else p_d * (d_amt / Decimal('100'))
+                        line_ht = FinancialEngine.quantize_money((p_d - u_disc) * FinancialEngine.to_decimal(it['qty']))
+                        row = [str(i), it.get('product_ref') or '', it['product_name'], q_s, FinancialEngine.format_money(p_d, False), FinancialEngine.format_money(d_amt, False)]
+                        if not is_bon:
+                            row.append(f"{float(it.get('tva', 0)):g}%")
+                        row.append(FinancialEngine.format_money(line_ht, False))
+                        table_data.append(row)
+
+                    pdf.totals = {
+                        'total_ht': calc['total_ht_final'],
+                        'total_tva': calc['total_tva_final'],
+                        'total_discount': calc['total_all_discounts_final'],
+                        'stamp_duty': calc['stamp_duty'] if calc['stamp_duty'] > 0 else None,
+                        'final_total': calc['final_total'],
+                    }
+                    pdf.amount_in_words = f"{FinancialEngine.number_to_words_fr(calc['final_total'])} dinars algériens."
+                    pdf.payment_info = {'amount': tx.get('paid_amount', 0)}
+
+                    pdf.balance_data = None
+                    if self.db.get_bool_setting('show_balance_in_pdf', False) and dt_code in (AppConstants.DOC_BV, AppConstants.DOC_BA) and not is_comptoir and ent:
+                        pdf.balance_data = _compute_historical_balance()
+
+                pdf.add_page()
+                pdf.draw_table_with_fill(headers, table_data, col_widths)
+                doc_file_prefix = vis['name'].replace(' ', '_')
 
             safe_client = ''.join(c for c in disp_ent if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_') or 'Client'
             safe_num = str(doc_num).replace('/', '-').replace('\\', '-').replace(':', '')
-            fname = f"{vis['name'].replace(' ', '_')}_{safe_num}_{safe_client}.pdf"
+            fname = f"{doc_file_prefix}_{safe_num}_{safe_client}.pdf"
 
             pdf.output(temp_pdf)
             with open(temp_pdf, 'rb') as f:
@@ -8343,48 +12536,165 @@ class StockApp(MDApp):
                 pass
             self.settings_menu_dialog = None
 
-        scroll_height = min(dp(340) if self.is_seller_mode else dp(500), Window.height * 0.62)
-        scroll_view = MDScrollView(size_hint_y=None, height=scroll_height, bar_width=dp(3))
+        wrapper = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(420) if self.is_seller_mode else dp(575), Window.height * 0.80),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+        scroll_view = MDScrollView(size_hint_y=1, bar_width=dp(3))
         content = MDBoxLayout(
             orientation='vertical',
             spacing=dp(12),
             size_hint_y=None,
             adaptive_height=True,
-            padding=[dp(2), dp(8), dp(4), dp(8)],
+            padding=[dp(2), dp(4), dp(4), dp(6)],
         )
+
+        def _make_wrapping_label(text_val: str, font_style: str, theme_color: str, bold: bool = False, text_color=None, min_h: float = 18):
+            lbl_kwargs = {
+                'text': text_val,
+                'font_style': font_style,
+                'bold': bold,
+                'theme_text_color': theme_color,
+                'size_hint_x': 1,
+                'size_hint_y': None,
+                'height': dp(min_h),
+                'halign': 'left',
+            }
+            if text_color is not None:
+                lbl_kwargs['text_color'] = text_color
+            lbl = MDLabel(**lbl_kwargs)
+            lbl.bind(
+                width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+                texture_size=lambda inst, val: setattr(inst, 'height', max(dp(min_h), val[1])),
+            )
+            return lbl
+
+        def _make_section_card():
+            return MDCard(
+                orientation='vertical',
+                padding=dp(12),
+                spacing=dp(8),
+                size_hint_y=None,
+                adaptive_height=True,
+                radius=[14],
+                elevation=0,
+                md_bg_color=(0.97, 0.98, 0.99, 1),
+                line_color=(0.88, 0.90, 0.94, 1),
+                line_width=1,
+            )
 
         def _add_card_header(parent_card, icon_name: str, title_text: str):
             hdr = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint_y=None, height=dp(24))
-            hdr.add_widget(MDIcon(icon=icon_name, theme_text_color='Custom', text_color=self.theme_cls.primary_color, font_size='20sp', pos_hint={'center_y': 0.5}))
-            hdr.add_widget(MDLabel(text=title_text, font_style='Caption', bold=True, theme_text_color='Custom', text_color=self.theme_cls.primary_color, pos_hint={'center_y': 0.5}))
+            hdr.add_widget(
+                MDIcon(
+                    icon=icon_name,
+                    theme_text_color='Custom',
+                    text_color=(0.09, 0.44, 0.84, 1),
+                    font_size='19sp',
+                    size_hint=(None, None),
+                    size=(dp(20), dp(20)),
+                    pos_hint={'center_y': 0.5},
+                )
+            )
+            hdr.add_widget(
+                MDLabel(
+                    text=title_text,
+                    font_style='Caption',
+                    bold=True,
+                    theme_text_color='Custom',
+                    text_color=(0.09, 0.44, 0.84, 1),
+                    size_hint_x=1,
+                    pos_hint={'center_y': 0.5},
+                )
+            )
             parent_card.add_widget(hdr)
 
         def _add_action_row(parent_card, title_txt: str, sub_txt: str, icon_name: str, icon_col, bg_col, cb, right_icon='chevron-right', title_col=None):
             row_card = MDCard(
                 orientation='horizontal',
-                padding=[dp(12), dp(8), dp(12), dp(8)],
+                padding=[dp(10), dp(8), dp(10), dp(8)],
                 spacing=dp(10),
                 size_hint_y=None,
-                height=dp(56),
-                radius=[10],
+                height=dp(58),
+                radius=[11],
                 elevation=0,
                 md_bg_color=bg_col,
+                line_color=(0.89, 0.91, 0.94, 1),
+                line_width=1,
                 ripple_behavior=True,
                 on_release=cb,
             )
-            row_card.add_widget(MDIcon(icon=icon_name, theme_text_color='Custom', text_color=icon_col, font_size='24sp', pos_hint={'center_y': 0.5}))
-            t_box = MDBoxLayout(orientation='vertical', pos_hint={'center_y': 0.5}, spacing=dp(2))
-            if title_col:
-                t_box.add_widget(MDLabel(text=title_txt, bold=True, font_style='Subtitle2', theme_text_color='Custom', text_color=title_col, shorten=True))
-            else:
-                t_box.add_widget(MDLabel(text=title_txt, bold=True, font_style='Subtitle2', theme_text_color='Primary', shorten=True))
-            t_box.add_widget(MDLabel(text=sub_txt, font_style='Caption', theme_text_color='Secondary', shorten=True))
+            ico_badge = MDCard(
+                size_hint=(None, None),
+                size=(dp(36), dp(36)),
+                radius=[10],
+                elevation=0,
+                md_bg_color=(icon_col[0], icon_col[1], icon_col[2], 0.12),
+                pos_hint={'center_y': 0.5},
+            )
+            ico_fl = MDFloatLayout()
+            ico_fl.add_widget(
+                MDIcon(
+                    icon=icon_name,
+                    theme_text_color='Custom',
+                    text_color=icon_col,
+                    font_size='20sp',
+                    size_hint=(None, None),
+                    size=(dp(22), dp(22)),
+                    halign='center',
+                    valign='middle',
+                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+                )
+            )
+            ico_badge.add_widget(ico_fl)
+            row_card.add_widget(ico_badge)
+
+            t_box = MDBoxLayout(
+                orientation='vertical',
+                size_hint_x=1,
+                size_hint_y=None,
+                adaptive_height=True,
+                pos_hint={'center_y': 0.5},
+                spacing=dp(2),
+            )
+            t_box.add_widget(
+                _make_wrapping_label(
+                    title_txt,
+                    'Subtitle2',
+                    'Custom' if title_col else 'Primary',
+                    bold=True,
+                    text_color=title_col,
+                    min_h=20,
+                )
+            )
+            t_box.add_widget(
+                _make_wrapping_label(
+                    sub_txt,
+                    'Caption',
+                    'Secondary',
+                    bold=False,
+                    min_h=16,
+                )
+            )
+            t_box.bind(height=lambda inst, val: setattr(row_card, 'height', max(dp(58), val + dp(16))))
             row_card.add_widget(t_box)
-            row_card.add_widget(MDIcon(icon=right_icon, theme_text_color='Hint', font_size='22sp', pos_hint={'center_y': 0.5}))
+            row_card.add_widget(
+                MDIcon(
+                    icon=right_icon,
+                    theme_text_color='Hint',
+                    font_size='21sp',
+                    size_hint=(None, None),
+                    size=(dp(22), dp(22)),
+                    pos_hint={'center_y': 0.5},
+                )
+            )
             parent_card.add_widget(row_card)
 
         def _add_checkbox_row(parent_card, label_txt: str, setting_key: str, default_val: bool = False):
-            row = MDBoxLayout(orientation='horizontal', size_hint_y=None, adaptive_height=True, padding=[dp(4), dp(2), 0, dp(2)], spacing=dp(8))
+            row = MDBoxLayout(orientation='horizontal', size_hint_y=None, adaptive_height=True, padding=[dp(6), dp(2), 0, dp(2)], spacing=dp(8))
             lbl = MDLabel(text=label_txt, theme_text_color='Primary', font_style='Body2', size_hint_x=1, size_hint_y=None, pos_hint={'center_y': 0.5})
             lbl.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)), texture_size=lambda inst, val: setattr(inst, 'height', max(dp(24), val[1])))
             chk = MDCheckbox(active=self.db.get_bool_setting(setting_key, default_val), size_hint=(None, None), size=(dp(40), dp(40)), pos_hint={'center_y': 0.5})
@@ -8404,19 +12714,22 @@ class StockApp(MDApp):
                 spacing=dp(6),
                 size_hint_y=None,
                 adaptive_height=True,
-                md_bg_color=(0.94, 0.98, 0.94, 1),
-                radius=[12],
-                elevation=1,
+                md_bg_color=(0.93, 0.98, 0.94, 1),
+                line_color=(0.72, 0.89, 0.76, 1),
+                line_width=1.1,
+                radius=[14],
+                elevation=0,
                 ripple_behavior=True,
                 on_release=lambda inst: [Clipboard.copy(activ_key), self.notify("Clé d'activation copiée", 'success')],
             )
             top_row = MDBoxLayout(orientation='horizontal', adaptive_height=True, spacing=dp(10))
-            top_row.add_widget(MDIcon(icon='shield-check', theme_text_color='Custom', text_color=(0, 0.65, 0.2, 1), font_size='26sp', pos_hint={'center_y': 0.5}))
-            top_row.add_widget(MDLabel(text='Licence Activée', font_style='Subtitle1', bold=True, theme_text_color='Custom', text_color=(0, 0.65, 0.2, 1), pos_hint={'center_y': 0.5}))
+            top_row.add_widget(MDIcon(icon='shield-check', theme_text_color='Custom', text_color=(0.04, 0.62, 0.24, 1), font_size='24sp', size_hint=(None, None), size=(dp(26), dp(26)), pos_hint={'center_y': 0.5}))
+            top_row.add_widget(_make_wrapping_label('Licence Activée', 'Subtitle1', 'Custom', bold=True, text_color=(0.04, 0.56, 0.22, 1), min_h=22))
+            top_row.add_widget(MDIcon(icon='content-copy', theme_text_color='Custom', text_color=(0.04, 0.56, 0.22, 1), font_size='18sp', size_hint=(None, None), size=(dp(20), dp(20)), pos_hint={'center_y': 0.5}))
             lic_card.add_widget(top_row)
-            lic_card.add_widget(MDLabel(text="Clé d'activation (appuyez pour copier) :", font_style='Caption', theme_text_color='Secondary', adaptive_height=True))
+            lic_card.add_widget(_make_wrapping_label("Clé d'activation (appuyez pour copier) :", 'Caption', 'Secondary', min_h=16))
             lbl_key = MDLabel(text=activ_key, font_style='Caption', theme_text_color='Primary', font_name='Roboto', bold=True, size_hint_y=None)
-            lbl_key.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)), texture_size=lambda inst, val: setattr(inst, 'height', max(dp(18), val[1])))
+            lbl_key.bind(width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)), texture_size=lambda inst, val: setattr(inst, 'height', max(dp(18), val[1])))
             lic_card.add_widget(lbl_key)
         else:
             lic_card = MDCard(
@@ -8425,56 +12738,59 @@ class StockApp(MDApp):
                 spacing=dp(6),
                 size_hint_y=None,
                 adaptive_height=True,
-                md_bg_color=(1, 0.95, 0.9, 1),
-                radius=[12],
-                elevation=1,
+                md_bg_color=(1, 0.96, 0.90, 1),
+                line_color=(0.94, 0.80, 0.62, 1),
+                line_width=1.1,
+                radius=[14],
+                elevation=0,
                 ripple_behavior=True,
                 on_release=lambda inst: [Clipboard.copy(dev_id), self.notify('ID copié', 'success')],
             )
             top_row = MDBoxLayout(orientation='horizontal', adaptive_height=True, spacing=dp(10))
-            top_row.add_widget(MDIcon(icon='shield-alert', theme_text_color='Custom', text_color=(0.9, 0.5, 0, 1), font_size='26sp', pos_hint={'center_y': 0.5}))
-            top_row.add_widget(MDLabel(text=f'Essai gratuit : {days_left} jour(s) restant(s)', font_style='Subtitle1', bold=True, theme_text_color='Custom', text_color=(0.9, 0.5, 0, 1), pos_hint={'center_y': 0.5}))
+            top_row.add_widget(MDIcon(icon='shield-alert', theme_text_color='Custom', text_color=(0.88, 0.45, 0, 1), font_size='24sp', size_hint=(None, None), size=(dp(26), dp(26)), pos_hint={'center_y': 0.5}))
+            top_row.add_widget(_make_wrapping_label(f'Essai gratuit : {days_left} jour(s) restant(s)', 'Subtitle1', 'Custom', bold=True, text_color=(0.85, 0.42, 0, 1), min_h=22))
+            top_row.add_widget(MDIcon(icon='content-copy', theme_text_color='Custom', text_color=(0.85, 0.42, 0, 1), font_size='18sp', size_hint=(None, None), size=(dp(20), dp(20)), pos_hint={'center_y': 0.5}))
             lic_card.add_widget(top_row)
-            lic_card.add_widget(MDLabel(text="ID de l'appareil (appuyez pour copier) :", font_style='Caption', theme_text_color='Secondary', adaptive_height=True))
-            lic_card.add_widget(MDLabel(text=dev_id, font_style='Caption', theme_text_color='Primary', font_name='Roboto', bold=True, adaptive_height=True))
+            lic_card.add_widget(_make_wrapping_label("ID de l'appareil (appuyez pour copier) :", 'Caption', 'Secondary', min_h=16))
+            lbl_dev = MDLabel(text=dev_id, font_style='Caption', theme_text_color='Primary', font_name='Roboto', bold=True, size_hint_y=None)
+            lbl_dev.bind(width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)), texture_size=lambda inst, val: setattr(inst, 'height', max(dp(18), val[1])))
+            lic_card.add_widget(lbl_dev)
         content.add_widget(lic_card)
 
         if not self.is_seller_mode:
             # 2. Carte Magasin & Règles
-            store_card = MDCard(orientation='vertical', padding=dp(12), spacing=dp(8), size_hint_y=None, adaptive_height=True, radius=[12], elevation=1, md_bg_color=(0.97, 0.97, 0.99, 1))
+            store_card = _make_section_card()
             _add_card_header(store_card, 'store-cog', 'MAGASIN & RÈGLES')
             store_name = self.db.get_setting('store_name', '') or AppConstants.APP_NAME
-            _add_action_row(store_card, 'Informations Magasin', self.fix_text(f'Actuel : {store_name}'), 'store', (0.1, 0.45, 0.8, 1), (0.93, 0.96, 1, 1), lambda x: self.show_store_settings_dialog())
-            store_card.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.92, 1)))
-            _add_checkbox_row(store_card, 'Autoriser la vente en stock négatif', 'allow_negative_stock', False)
-            store_card.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.92, 1)))
+            _add_action_row(store_card, 'Informations Magasin', self.fix_text(f'Actuel : {store_name}'), 'store', (0.09, 0.44, 0.84, 1), (0.94, 0.97, 1, 1), lambda x: self.show_store_settings_dialog())
+            _add_checkbox_row(store_card, 'Autoriser la vente en stock négatif', 'allow_negative_stock', True)
+            store_card.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.91, 0.94, 1)))
             _add_checkbox_row(store_card, 'Avertir si prix vente < prix achat', 'warn_price_below_cost', True)
             content.add_widget(store_card)
 
             # 3. Carte Données & Sauvegarde
-            data_card = MDCard(orientation='vertical', padding=dp(12), spacing=dp(8), size_hint_y=None, adaptive_height=True, radius=[12], elevation=1, md_bg_color=(0.97, 0.97, 0.99, 1))
+            data_card = _make_section_card()
             _add_card_header(data_card, 'database-cog', 'DONNÉES & SAUVEGARDE')
-            _add_action_row(data_card, 'Exporter Produits', 'Direct Excel (.xlsx)', 'file-export', (0.1, 0.6, 0.3, 1), (1, 1, 1, 1), lambda x: self.perform_export())
-            _add_action_row(data_card, 'Importer Produits', 'Depuis Excel (.xlsx)', 'file-import', (0.1, 0.45, 0.8, 1), (1, 1, 1, 1), lambda x: [self.settings_menu_dialog.dismiss(), self.import_data_dialog()])
-            _add_action_row(data_card, 'Sauvegarde Locale', 'Archive complète (.zip)', 'database-export', (0.4, 0.2, 0.7, 1), (1, 1, 1, 1), lambda x: self.perform_local_backup('manual'))
-            _add_action_row(data_card, 'Partager Sauvegarde', 'Quick Share & Bluetooth (.zip)', 'cloud-upload', (0.0, 0.55, 0.65, 1), (1, 1, 1, 1), lambda x: self.share_database_file())
+            _add_action_row(data_card, 'Exporter Produits', 'Direct Excel (.xlsx)', 'file-export', (0.06, 0.58, 0.25, 1), (1, 1, 1, 1), lambda x: self.perform_export())
+            _add_action_row(data_card, 'Importer Produits', 'Depuis Excel (.xlsx)', 'file-import', (0.09, 0.44, 0.84, 1), (1, 1, 1, 1), lambda x: [self.settings_menu_dialog.dismiss(), self.import_data_dialog()])
+            _add_action_row(data_card, 'Sauvegarde Locale', 'Archive complète (.zip)', 'database-export', (0.45, 0.2, 0.72, 1), (1, 1, 1, 1), lambda x: self.perform_local_backup('manual'))
+            _add_action_row(data_card, 'Partager Sauvegarde', 'Bluetooth / Quick Share (.zip)', 'cloud-upload', (0.0, 0.55, 0.65, 1), (1, 1, 1, 1), lambda x: self.share_database_file())
             _add_action_row(data_card, 'Restaurer', 'Depuis une archive (.zip / .db)', 'backup-restore', (0.85, 0.45, 0.0, 1), (1, 0.97, 0.92, 1), lambda x: [self.settings_menu_dialog.dismiss(), self.show_restore_dialog()])
             content.add_widget(data_card)
 
             # 4. Carte Imprimante & PDF
-            printer_card = MDCard(orientation='vertical', padding=dp(12), spacing=dp(8), size_hint_y=None, adaptive_height=True, radius=[12], elevation=1, md_bg_color=(0.97, 0.97, 0.99, 1))
+            printer_card = _make_section_card()
             _add_card_header(printer_card, 'printer', 'IMPRIMANTE & PDF')
             p_name = self.db.get_setting('printer_name', 'Non configurée') or 'Non configurée'
-            _add_action_row(printer_card, 'Configurer Imprimante', f'Actuelle : {p_name}', 'printer-wireless', (0.1, 0.45, 0.8, 1), (1, 1, 1, 1), lambda x: [self.settings_menu_dialog.dismiss(), self.open_bluetooth_selector(x)])
-            _add_action_row(printer_card, "Oublier l'imprimante", "Dissocier l'appareil actuel", 'printer-off', (0.8, 0.15, 0.15, 1), (1, 0.95, 0.95, 1), self.clear_printer_selection, title_col=(0.8, 0.15, 0.15, 1))
-            printer_card.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.92, 1)))
+            _add_action_row(printer_card, 'Configurer Imprimante', f'Actuelle : {p_name}', 'printer-wireless', (0.09, 0.44, 0.84, 1), (1, 1, 1, 1), lambda x: [self.settings_menu_dialog.dismiss(), self.open_bluetooth_selector(x)])
+            _add_action_row(printer_card, "Oublier l'imprimante", "Dissocier l'appareil actuel", 'printer-off', (0.82, 0.14, 0.14, 1), (1, 0.95, 0.95, 1), self.clear_printer_selection, title_col=(0.82, 0.14, 0.14, 1))
             _add_checkbox_row(printer_card, 'Impression Auto (Bluetooth 80 mm)', 'printer_auto', False)
-            printer_card.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.9, 0.92, 1)))
+            printer_card.add_widget(MDSeparator(height=dp(1), color=(0.9, 0.91, 0.94, 1)))
             _add_checkbox_row(printer_card, 'Afficher le solde sur PDF (BV / BA)', 'show_balance_in_pdf', False)
             content.add_widget(printer_card)
 
         # 5. Carte Sécurité
-        sec_card = MDCard(orientation='vertical', padding=dp(12), spacing=dp(8), size_hint_y=None, adaptive_height=True, radius=[12], elevation=1, md_bg_color=(0.97, 0.97, 0.99, 1))
+        sec_card = _make_section_card()
         _add_card_header(sec_card, 'shield-account', 'SÉCURITÉ')
         mode_lbl = 'Mode Vendeur (Restreint)' if self.is_seller_mode else 'Mode Administrateur (Complet)'
         _add_action_row(
@@ -8482,7 +12798,7 @@ class StockApp(MDApp):
             'Mode Admin / Vendeur',
             f'Actif : {mode_lbl}',
             'shield-key',
-            (0.3, 0.3, 0.75, 1),
+            (0.28, 0.32, 0.78, 1),
             (1, 1, 1, 1),
             lambda x: [self.settings_menu_dialog.dismiss(), Clock.schedule_once(lambda dt: self.open_seller_auth_dialog(), 0.12)],
         )
@@ -8491,31 +12807,63 @@ class StockApp(MDApp):
         # 6. Carte Mise à jour & Version
         update_card = MDCard(
             orientation='horizontal',
-            padding=[dp(14), dp(10), dp(14), dp(10)],
+            padding=[dp(12), dp(10)],
             spacing=dp(12),
             size_hint_y=None,
             height=dp(60),
-            radius=[12],
-            elevation=1,
+            radius=[14],
+            elevation=0,
             md_bg_color=(0.92, 0.97, 0.97, 1),
+            line_color=(0.76, 0.89, 0.89, 1),
+            line_width=1,
             ripple_behavior=True,
             on_release=lambda x: [self.settings_menu_dialog.dismiss(), webbrowser.open('https://mobile.magpro-soft.com/')],
         )
-        update_card.add_widget(MDIcon(icon='cloud-download', theme_text_color='Custom', text_color=(0.1, 0.55, 0.55, 1), font_size='28sp', pos_hint={'center_y': 0.5}))
-        upd_txt = MDBoxLayout(orientation='vertical', pos_hint={'center_y': 0.5}, spacing=dp(2))
-        upd_txt.add_widget(MDLabel(text="Mise à jour de l'application", bold=True, font_style='Subtitle1', theme_text_color='Primary'))
-        upd_txt.add_widget(MDLabel(text=f'Version actuelle : {AppConstants.APP_VERSION} • © {AppConstants.COPYRIGHT_YEAR}', font_style='Caption', theme_text_color='Secondary'))
+        upd_badge = MDCard(size_hint=(None, None), size=(dp(38), dp(38)), radius=[10], elevation=0, md_bg_color=(0.08, 0.55, 0.55, 0.14), pos_hint={'center_y': 0.5})
+        upd_fl = MDFloatLayout()
+        upd_fl.add_widget(MDIcon(icon='cloud-download', theme_text_color='Custom', text_color=(0.08, 0.55, 0.55, 1), font_size='22sp', size_hint=(None, None), size=(dp(24), dp(24)), halign='center', valign='middle', pos_hint={'center_x': 0.5, 'center_y': 0.5}))
+        upd_badge.add_widget(upd_fl)
+        update_card.add_widget(upd_badge)
+
+        upd_txt = MDBoxLayout(orientation='vertical', size_hint_x=1, size_hint_y=None, adaptive_height=True, pos_hint={'center_y': 0.5}, spacing=dp(2))
+        upd_txt.add_widget(_make_wrapping_label("Mise à jour de l'application", 'Subtitle2', 'Primary', bold=True, min_h=20))
+        upd_txt.add_widget(_make_wrapping_label(f'Version actuelle : {AppConstants.APP_VERSION} • © {AppConstants.COPYRIGHT_YEAR}', 'Caption', 'Secondary', min_h=16))
+        upd_txt.bind(height=lambda inst, val: setattr(update_card, 'height', max(dp(60), val + dp(20))))
         update_card.add_widget(upd_txt)
-        update_card.add_widget(MDIcon(icon='open-in-new', theme_text_color='Hint', font_size='22sp', pos_hint={'center_y': 0.5}))
+        update_card.add_widget(MDIcon(icon='open-in-new', theme_text_color='Hint', font_size='20sp', size_hint=(None, None), size=(dp(22), dp(22)), pos_hint={'center_y': 0.5}))
         content.add_widget(update_card)
 
         scroll_view.add_widget(content)
+        wrapper.add_widget(scroll_view)
+
+        btn_close = MDCard(
+            size_hint=(1, None),
+            height=dp(46),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: self.settings_menu_dialog.dismiss() if getattr(self, 'settings_menu_dialog', None) else None,
+        )
+        btn_close.add_widget(
+            MDLabel(
+                text='FERMER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+        wrapper.add_widget(btn_close)
+
         self.settings_menu_dialog = MDDialog(
             title='Paramètres & Configuration',
             type='custom',
-            content_cls=scroll_view,
-            radius=[15, 15, 15, 15],
-            buttons=[MDFlatButton(text='FERMER', theme_text_color='Error', on_release=lambda x: self.settings_menu_dialog.dismiss())],
+            content_cls=wrapper,
+            radius=[18, 18, 18, 18],
+            buttons=[],
             size_hint=(0.95, None),
         )
         self.settings_menu_dialog.open()
@@ -8523,24 +12871,61 @@ class StockApp(MDApp):
     def show_store_settings_dialog(self):
         if getattr(self, 'settings_menu_dialog', None):
             self.settings_menu_dialog.dismiss()
-        scroll = MDScrollView(size_hint_y=None, height=dp(560))
-        box = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(12), padding=dp(10))
+
+        wrapper = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(580), Window.height * 0.80),
+            padding=[dp(2), dp(4), dp(2), dp(2)],
+        )
+        scroll = MDScrollView(size_hint_y=1)
+        main_box = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(12), padding=[dp(2), dp(4), dp(4), dp(8)])
+
+        def _make_section(bg_col, border_col, icon_name: str, title_txt: str):
+            c = MDCard(
+                orientation='vertical',
+                radius=[14],
+                padding=dp(14),
+                spacing=dp(10),
+                elevation=0,
+                adaptive_height=True,
+                md_bg_color=bg_col,
+                line_color=border_col,
+                line_width=1,
+            )
+            hdr = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint_y=None, height=dp(26))
+            hdr.add_widget(MDIcon(icon=icon_name, theme_text_color='Primary', font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+            hdr.add_widget(MDLabel(text=title_txt, bold=True, theme_text_color='Primary', font_style='Subtitle2', pos_hint={'center_y': 0.5}))
+            c.add_widget(hdr)
+            c.add_widget(MDSeparator(height=dp(1), color=(0, 0, 0, 0.08)))
+            return c
 
         fields = {}
-        for key, label in (
-            ('store_name', 'Nom du Magasin'),
-            ('store_activity', 'Activité'),
-            ('store_phone', 'Téléphone'),
-            ('store_address', 'Adresse'),
-            ('store_email', 'Email'),
-            ('store_rc', 'N° RC'),
-            ('store_nif', 'N.I.F'),
-            ('store_nis', 'N.I.S'),
-            ('store_nai', 'N.A.I'),
-        ):
+
+        card_id = _make_section((1, 1, 1, 1), (0.88, 0.90, 0.94, 1), 'store-outline', 'Identité du Magasin')
+        for key, label, ic in (('store_name', 'Nom du Magasin', 'store'), ('store_activity', 'Activité', 'briefcase')):
+            tf = SmartTextField(text=self.db.get_setting(key, ''), hint_text=label, icon_right=ic)
+            fields[key] = tf
+            card_id.add_widget(tf)
+        main_box.add_widget(card_id)
+
+        card_ct = _make_section((0.96, 0.98, 1, 1), (0.82, 0.89, 0.97, 1), 'card-account-phone-outline', 'Coordonnées')
+        for key, label, ic in (('store_phone', 'Téléphone', 'phone'), ('store_address', 'Adresse', 'map-marker'), ('store_email', 'Email', 'email')):
+            tf = SmartTextField(text=self.db.get_setting(key, ''), hint_text=label, icon_right=ic)
+            fields[key] = tf
+            card_ct.add_widget(tf)
+        main_box.add_widget(card_ct)
+
+        card_fisc = _make_section((0.97, 0.97, 0.98, 1), (0.88, 0.89, 0.92, 1), 'file-document-multiple-outline', 'Informations Fiscales & Bancaires')
+        for key, label in (('store_rc', 'N° RC'), ('store_nif', 'N.I.F'), ('store_nis', 'N.I.S'), ('store_nai', 'N.A.I'), ('store_rib', 'R.I.B')):
             tf = SmartTextField(text=self.db.get_setting(key, ''), hint_text=label)
             fields[key] = tf
-            box.add_widget(tf)
+            card_fisc.add_widget(tf)
+        main_box.add_widget(card_fisc)
+
+        scroll.add_widget(main_box)
+        wrapper.add_widget(scroll)
 
         def _save(x):
             for k, tf in fields.items():
@@ -8549,10 +12934,44 @@ class StockApp(MDApp):
             self.store_settings_dialog.dismiss()
             self.open_settings_menu()
 
-        box.add_widget(MDRaisedButton(text='ENREGISTRER', md_bg_color=(0, 0.7, 0.2, 1), size_hint_x=1, height=dp(48), on_release=_save))
-        box.add_widget(MDRaisedButton(text='ANNULER', md_bg_color=(0.9, 0.9, 0.9, 1), text_color=(0.2, 0.2, 0.2, 1), size_hint_x=1, height=dp(48), on_release=lambda x: [self.store_settings_dialog.dismiss(), self.open_settings_menu()]))
-        scroll.add_widget(box)
-        self.store_settings_dialog = MDDialog(title='Informations du Magasin', type='custom', content_cls=scroll, size_hint=(0.95, 0.92))
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(10), size_hint=(1, None), height=dp(48))
+        btn_cancel = MDCard(
+            size_hint_x=0.35,
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda *a: [self.store_settings_dialog.dismiss(), self.open_settings_menu()],
+        )
+        btn_cancel.add_widget(MDLabel(text='ANNULER', bold=True, font_style='Button', halign='center', valign='middle', theme_text_color='Custom', text_color=(0.35, 0.35, 0.4, 1)))
+
+        btn_save = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.65,
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.0, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+            on_release=_save,
+        )
+        btn_save.add_widget(MDBoxLayout())
+        btn_save.add_widget(MDIcon(icon='check-circle-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='20sp', size_hint_x=None, width=dp(22), pos_hint={'center_y': 0.5}))
+        btn_save.add_widget(MDLabel(text='ENREGISTRER', bold=True, font_size='15sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_save.add_widget(MDBoxLayout())
+
+        btns.add_widget(btn_cancel)
+        btns.add_widget(btn_save)
+        wrapper.add_widget(btns)
+
+        self.store_settings_dialog = MDDialog(
+            title='Informations du Magasin',
+            type='custom',
+            content_cls=wrapper,
+            size_hint=(0.95, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
         self.store_settings_dialog.open()
 
     def open_seller_auth_dialog(self):
@@ -8807,26 +13226,178 @@ class StockApp(MDApp):
                 self.pdf_ready_dialog.dismiss()
             self._share_or_open_exported_file(saved_path, saved_uri, 'application/pdf', action=act_mode)
 
-        btn_close = MDFlatButton(
-            text='FERMER',
-            on_release=lambda x: self.pdf_ready_dialog.dismiss() if getattr(self, 'pdf_ready_dialog', None) else None,
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(12),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=[0, 0, 0, dp(2)],
         )
-        btn_open = MDRaisedButton(
-            text='OUVRIR',
-            md_bg_color=(0.1, 0.45, 0.8, 1),
+
+        badge = MDCard(
+            size_hint=(None, None),
+            size=(dp(56), dp(56)),
+            radius=[28],
+            elevation=0,
+            md_bg_color=(0.90, 0.98, 0.92, 1),
+            pos_hint={'center_x': 0.5},
         )
+        b_fl = MDFloatLayout()
+        b_fl.add_widget(
+            MDIcon(
+                icon='file-check-outline',
+                theme_text_color='Custom',
+                text_color=(0.04, 0.62, 0.25, 1),
+                font_size='28sp',
+                size_hint=(None, None),
+                size=(dp(30), dp(30)),
+                halign='center',
+                valign='middle',
+                pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            )
+        )
+        badge.add_widget(b_fl)
+        content.add_widget(badge)
+
+        content.add_widget(
+            MDLabel(
+                text='PDF Enregistré',
+                halign='center',
+                font_style='H6',
+                bold=True,
+                theme_text_color='Primary',
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+
+        info_card = MDCard(
+            orientation='vertical',
+            padding=[dp(12), dp(10)],
+            spacing=dp(6),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.95, 0.97, 1, 1),
+            line_color=(0.84, 0.88, 0.95, 1),
+            line_width=1,
+            size_hint_y=None,
+            adaptive_height=True,
+        )
+        lbl_dir = MDLabel(
+            text='Fichier enregistré dans Téléchargements :',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Secondary',
+            size_hint_y=None,
+        )
+        lbl_dir.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(18), val[1])),
+        )
+        info_card.add_widget(lbl_dir)
+
+        file_row = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint_y=None, adaptive_height=True)
+        file_row.add_widget(
+            MDIcon(
+                icon='file-pdf-box',
+                theme_text_color='Custom',
+                text_color=(0.82, 0.16, 0.16, 1),
+                font_size='22sp',
+                size_hint=(None, None),
+                size=(dp(24), dp(24)),
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        lbl_file = MDLabel(
+            text=self.fix_text(fname),
+            font_style='Body2',
+            bold=True,
+            theme_text_color='Primary',
+            font_name='ArabicFont',
+            size_hint_y=None,
+        )
+        lbl_file.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (max(1, val), None)),
+            texture_size=lambda inst, val: setattr(inst, 'height', max(dp(20), val[1])),
+        )
+        file_row.add_widget(lbl_file)
+        info_card.add_widget(file_row)
+        content.add_widget(info_card)
+
+        actions_row = MDBoxLayout(
+            orientation='horizontal',
+            spacing=dp(10),
+            size_hint=(1, None),
+            height=dp(48),
+        )
+
+        btn_open = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.5,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.09, 0.44, 0.84, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
+        )
+        btn_open.add_widget(MDBoxLayout())
+        btn_open.add_widget(MDIcon(icon='file-eye-outline', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+        btn_open.add_widget(MDLabel(text='OUVRIR', bold=True, font_size='14sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_open.add_widget(MDBoxLayout())
         btn_open.bind(on_release=lambda inst: _on_pdf_action(inst, 'view'))
 
-        btn_share = MDRaisedButton(
-            text='PARTAGER',
-            md_bg_color=(0, 0.65, 0.25, 1),
+        btn_share = MDCard(
+            orientation='horizontal',
+            size_hint_x=0.5,
+            size_hint_y=None,
+            height=dp(48),
+            radius=[12],
+            elevation=1,
+            md_bg_color=(0.04, 0.62, 0.25, 1),
+            ripple_behavior=True,
+            spacing=dp(6),
         )
+        btn_share.add_widget(MDBoxLayout())
+        btn_share.add_widget(MDIcon(icon='share-variant', theme_text_color='Custom', text_color=(1, 1, 1, 1), font_size='19sp', size_hint_x=None, width=dp(21), pos_hint={'center_y': 0.5}))
+        btn_share.add_widget(MDLabel(text='PARTAGER', bold=True, font_size='14sp', theme_text_color='Custom', text_color=(1, 1, 1, 1), adaptive_width=True, pos_hint={'center_y': 0.5}))
+        btn_share.add_widget(MDBoxLayout())
         btn_share.bind(on_release=lambda inst: _on_pdf_action(inst, 'share'))
 
+        actions_row.add_widget(btn_open)
+        actions_row.add_widget(btn_share)
+        content.add_widget(actions_row)
+
+        btn_close = MDCard(
+            size_hint=(1, None),
+            height=dp(44),
+            radius=[12],
+            elevation=0,
+            md_bg_color=(0.92, 0.93, 0.95, 1),
+            ripple_behavior=True,
+            on_release=lambda x: self.pdf_ready_dialog.dismiss() if getattr(self, 'pdf_ready_dialog', None) else None,
+        )
+        btn_close.add_widget(
+            MDLabel(
+                text='FERMER',
+                bold=True,
+                font_style='Button',
+                halign='center',
+                valign='middle',
+                theme_text_color='Custom',
+                text_color=(0.35, 0.35, 0.4, 1),
+            )
+        )
+        content.add_widget(btn_close)
+
         self.pdf_ready_dialog = MDDialog(
-            title='PDF Enregistré',
-            text=f'Fichier enregistré dans Téléchargements :\n{fname}',
-            buttons=[btn_close, btn_open, btn_share],
+            title='',
+            type='custom',
+            content_cls=content,
+            radius=[20, 20, 20, 20],
+            size_hint=(0.90, None),
+            buttons=[],
         )
         self.pdf_ready_dialog.open()
 
@@ -9111,44 +13682,46 @@ class StockApp(MDApp):
         self.perform_local_backup('rolling')
 
     def share_database_file(self):
+        temp_db = os.path.join(self.user_data_dir, 'temp_share.db')
+        temp_zip = os.path.join(self.user_data_dir, 'temp_share.zip')
         try:
             fname = f"MagPro_Share_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.zip"
-            zip_path = self.get_unified_path(fname)
-            temp_db = os.path.join(self.user_data_dir, 'temp_share.db')
+            if os.path.exists(temp_db):
+                os.remove(temp_db)
+            if os.path.exists(temp_zip):
+                os.remove(temp_zip)
+
             src_conn = sqlite3.connect(self.db.db_path)
             dst_conn = sqlite3.connect(temp_db)
             src_conn.backup(dst_conn)
             dst_conn.close()
             src_conn.close()
 
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
                 zf.write(temp_db, arcname=AppConstants.DB_NAME)
                 img_dir = os.path.join(self.user_data_dir, 'product_images')
                 if os.path.exists(img_dir):
                     for root, _, files in os.walk(img_dir):
                         for f in files:
                             zf.write(os.path.join(root, f), arcname=os.path.join('product_images', f))
-            if os.path.exists(temp_db):
-                os.remove(temp_db)
 
+            with open(temp_zip, 'rb') as f:
+                zip_bytes = f.read()
+
+            saved_path, saved_uri = self._save_bytes_to_downloads(fname, zip_bytes, 'application/zip')
             if platform == 'android':
-                from jnius import autoclass, cast
-                intent_cls = autoclass('android.content.Intent')
-                uri_cls = autoclass('android.net.Uri')
-                file_cls = autoclass('java.io.File')
-                str_cls = autoclass('java.lang.String')
-                strict = autoclass('android.os.StrictMode')
-                strict.setVmPolicy(autoclass('android.os.StrictMode$VmPolicy$Builder')().build())
-
-                share_i = intent_cls(intent_cls.ACTION_SEND)
-                share_i.setType('application/zip')
-                share_i.putExtra(intent_cls.EXTRA_STREAM, cast('android.os.Parcelable', uri_cls.fromFile(file_cls(zip_path))))
-                share_i.addFlags(intent_cls.FLAG_GRANT_READ_URI_PERMISSION)
-                cast('android.app.Activity', PythonActivity.mActivity).startActivity(intent_cls.createChooser(share_i, str_cls(f'Partager : {fname}')))
+                self._share_or_open_exported_file(saved_path, saved_uri, 'application/zip', action='share')
             else:
-                self.notify(f'Archive créée : {zip_path}', 'success')
+                self.notify(f'Archive créée : {saved_path}', 'success')
         except Exception as exc:
             self.notify(f'Erreur partage : {exc}', 'error')
+        finally:
+            for tf in (temp_db, temp_zip):
+                if os.path.exists(tf):
+                    try:
+                        os.remove(tf)
+                    except Exception:
+                        pass
 
     def show_restore_dialog(self):
         if platform == 'android':
