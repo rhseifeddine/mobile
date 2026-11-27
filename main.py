@@ -3750,16 +3750,17 @@ class _SmoothRecycleView(RecycleView):
         self.do_scroll_x = False
         self.do_scroll_y = True
         self.scroll_type = ['bars', 'content']
-        self.bar_width = dp(4)
-        self.scroll_distance = dp(10)
+        self.bar_width = dp(6)
+        self.scroll_distance = dp(8)
         self.scroll_timeout = 150
+        self.scroll_wheel_distance = dp(72)
         Clock.schedule_once(self._configure_scroll_effect, 0)
 
     def _configure_scroll_effect(self, dt=0):
         if hasattr(self, 'effect_y') and self.effect_y:
-            self.effect_y.friction = 0.18
+            self.effect_y.friction = 0.08
             if hasattr(self.effect_y, 'min_velocity'):
-                self.effect_y.min_velocity = dp(12)
+                self.effect_y.min_velocity = dp(8)
 
     def on_scroll_move(self, touch):
         res = super().on_scroll_move(touch)
@@ -3773,7 +3774,7 @@ class _SmoothRecycleView(RecycleView):
 
     def _clamp_velocity(self):
         if hasattr(self, 'effect_y') and self.effect_y:
-            max_v = dp(1800)
+            max_v = dp(3200)
             vel = getattr(self.effect_y, 'velocity', 0)
             if vel > max_v:
                 self.effect_y.velocity = max_v
@@ -4448,12 +4449,19 @@ class StockApp(MDApp):
             rv._restoring_scroll = True
             rv.data = new_data
             rv.refresh_from_data()
-            if getattr(rv, 'effect_y', None):
-                rv.effect_y.velocity = 0.0
-                rv.effect_y.value = 0.0
             rv.scroll_y = 1.0
-            rv._restoring_scroll = False
-            rv.loading_lock = False
+
+            def _sync_top(*_):
+                if getattr(rv, '_scroll_gen', 0) != gen:
+                    return
+                rv.scroll_y = 1.0
+                if getattr(rv, 'effect_y', None):
+                    rv.effect_y.velocity = 0.0
+                    rv.effect_y.value = rv.effect_y.min
+                rv._restoring_scroll = False
+                rv.loading_lock = False
+
+            Clock.schedule_once(_sync_top, 0)
             return
 
         if not new_data:
@@ -4502,23 +4510,21 @@ class StockApp(MDApp):
                 scrollable_h = max(1.0, actual_h - cur_vp_h)
                 clamped_dist = max(0.0, min(scrollable_h, dist_from_top))
                 target_sy = max(0.0, min(1.0, 1.0 - (clamped_dist / scrollable_h)))
+                target_eff = -target_sy * scrollable_h
                 if getattr(rv, 'effect_y', None):
                     rv.effect_y.min = -scrollable_h
                     rv.effect_y.max = 0.0
-                    rv.effect_y.value = -clamped_dist
-                    rv.effect_y.velocity = 0.0
+                    rv.effect_y.value = target_eff
             rv.scroll_y = target_sy
 
         def _release_scroll_lock(*_):
             if getattr(rv, '_scroll_gen', 0) != gen:
                 return
-            _apply_exact_scroll()
             rv._restoring_scroll = False
             rv.loading_lock = False
 
-        _apply_exact_scroll()
         Clock.schedule_once(_apply_exact_scroll, 0)
-        Clock.schedule_once(_release_scroll_lock, 0.06)
+        Clock.schedule_once(_release_scroll_lock, 0.02)
 
     # --------------------------------------------------------------------------
     # 7.1 CYCLE DE VIE, LICENCE & PERMISSIONS ANDROID
@@ -4606,8 +4612,34 @@ class StockApp(MDApp):
 
     def on_stop(self):
         try:
-            self.trigger_auto_backups()
-            if self.db:
+            if getattr(self, 'db', None):
+                lock = getattr(self, '_auto_backup_lock', None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._auto_backup_lock = lock
+                if lock.acquire(timeout=1.5):
+                    try:
+                        bdir = self.get_backup_directory()
+                        today_daily = os.path.join(bdir, f"Backup_Daily_{datetime.now().strftime('%Y-%m-%d')}.zip")
+                        now_ts = time.time()
+                        skip_exit_bk = False
+                        try:
+                            recent = [
+                                os.path.getmtime(os.path.join(bdir, f))
+                                for f in os.listdir(bdir)
+                                if f.startswith(('Backup_Daily_', 'Backup_Rolling_')) and f.endswith('.zip')
+                            ]
+                            if recent and (now_ts - max(recent)) < 60:
+                                skip_exit_bk = True
+                        except Exception:
+                            pass
+                        if not skip_exit_bk:
+                            if not os.path.exists(today_daily):
+                                self.perform_local_backup('daily')
+                            else:
+                                self.perform_local_backup('rolling')
+                    finally:
+                        lock.release()
                 self.db.cleanup_wal_files()
         except Exception:
             pass
@@ -4704,6 +4736,7 @@ class StockApp(MDApp):
                 win_children[0].dismiss()
                 return True
             dialog_names = (
+                'note_dialog', 'conf_diag',
                 'exp_cat_dialog', '_active_filter_dialog', 'hist_filter_dialog',
                 'del_exp_dialog', 'confirm_del_dialog', 'smart_pdf_dialog', 'pdf_ready_dialog',
                 'final_restore_confirm', 'stock_error_dialog', 'warn_cost_dlg',
@@ -5272,35 +5305,47 @@ class StockApp(MDApp):
     # --------------------------------------------------------------------------
     def _build_login_screen(self):
         screen = MDScreen(name='login')
-        screen.md_bg_color = (0.94, 0.95, 0.97, 1)
+        screen.md_bg_color = (0.92, 0.95, 0.99, 1)
         layout = MDFloatLayout()
+
+        top_banner = MDCard(
+            size_hint=(1, 0.42),
+            pos_hint={'top': 1},
+            radius=[0, 0, 34, 34],
+            elevation=0,
+            md_bg_color=(0.09, 0.44, 0.84, 1),
+        )
+        layout.add_widget(top_banner)
 
         card = MDCard(
             orientation='vertical',
             size_hint=(0.88, None),
             adaptive_height=True,
             pos_hint={'center_x': 0.5, 'center_y': 0.53},
-            padding=[dp(24), dp(28), dp(24), dp(24)],
-            spacing=dp(14),
+            padding=[dp(24), dp(28), dp(24), dp(26)],
+            spacing=dp(15),
             radius=[24, 24, 24, 24],
             elevation=3,
             md_bg_color=(1, 1, 1, 1),
+            line_color=(0.82, 0.89, 0.98, 1),
+            line_width=1,
         )
 
         icon_badge = self._ui_icon_pill(
             'store-check',
-            (0.91, 0.95, 1, 1),
-            (0.1, 0.45, 0.85, 1),
+            (0.90, 0.95, 1, 1),
+            (0.09, 0.44, 0.84, 1),
             size_dp=78,
             radius=39,
             icon_size='44sp',
+            border_color=(0.76, 0.86, 0.98, 1),
         )
         icon_badge.pos_hint = {'center_x': 0.5}
         card.add_widget(icon_badge)
 
         title_box = MDBoxLayout(orientation='vertical', size_hint_y=None, adaptive_height=True, spacing=dp(4))
-        title_box.add_widget(MDLabel(text=AppConstants.APP_NAME, halign='center', font_style='H5', bold=True, adaptive_height=True, theme_text_color='Custom', text_color=(0.12, 0.14, 0.18, 1)))
-        title_box.add_widget(MDLabel(text='Authentification', halign='center', font_style='Caption', theme_text_color='Secondary', adaptive_height=True))
+        title_box.add_widget(MDLabel(text=AppConstants.APP_NAME, halign='center', font_style='H5', bold=True, adaptive_height=True, theme_text_color='Custom', text_color=(0.08, 0.16, 0.28, 1)))
+        title_box.add_widget(MDLabel(text='Authentification', halign='center', font_style='Caption', theme_text_color='Custom', text_color=(0.40, 0.48, 0.60, 1), adaptive_height=True))
         card.add_widget(title_box)
 
         pass_card = MDCard(
@@ -5309,9 +5354,9 @@ class StockApp(MDApp):
             height=dp(58),
             radius=[12],
             elevation=0,
-            md_bg_color=(0.95, 0.96, 0.98, 1),
-            line_color=(0.85, 0.88, 0.94, 1),
-            line_width=1,
+            md_bg_color=(0.95, 0.97, 1, 1),
+            line_color=(0.80, 0.87, 0.96, 1),
+            line_width=1.1,
             padding=[dp(14), dp(2), dp(4), dp(2)],
             spacing=dp(8),
         )
@@ -5319,7 +5364,7 @@ class StockApp(MDApp):
             MDIcon(
                 icon='lock-outline',
                 theme_text_color='Custom',
-                text_color=(0.1, 0.45, 0.85, 1),
+                text_color=(0.09, 0.44, 0.84, 1),
                 font_size='22sp',
                 size_hint_x=None,
                 width=dp(24),
@@ -5351,7 +5396,7 @@ class StockApp(MDApp):
         card.add_widget(
             self._ui_card_btn(
                 'SE CONNECTER',
-                (0.1, 0.45, 0.85, 1),
+                (0.09, 0.44, 0.84, 1),
                 icon='login',
                 height=50,
                 font_size='16sp',
@@ -5361,40 +5406,17 @@ class StockApp(MDApp):
         )
         layout.add_widget(card)
 
-        btn_chg_pw = self._ui_card_btn(
-            'Changer / Définir le mot de passe',
-            (0.89, 0.91, 0.95, 1),
-            text_color=(0.25, 0.3, 0.4, 1),
-            icon='key-change',
-            height=42,
-            radius=21,
-            font_size='12.5sp',
-            border_color=(0.82, 0.85, 0.91, 1),
-            on_release=self.show_change_password_dialog_login,
-        )
-        btn_chg_pw.size_hint = (None, None)
-        btn_chg_pw.height = dp(42)
-        btn_chg_pw.pos_hint = {'center_x': 0.5, 'y': 0.09}
-
-        def _fit_chg_pw_btn(*_):
-            btn_chg_pw._lbl.text_size = (None, None)
-            btn_chg_pw._lbl.texture_update()
-            needed = btn_chg_pw._lbl.texture_size[0] + dp(56)
-            btn_chg_pw.width = max(dp(260), min(Window.width * 0.88, needed))
-
-        Window.bind(width=lambda *_: _fit_chg_pw_btn())
-        Clock.schedule_once(lambda dt: _fit_chg_pw_btn(), 0)
-        layout.add_widget(btn_chg_pw)
-
         layout.add_widget(
             MDLabel(
                 text=f'{AppConstants.APP_NAME} v{AppConstants.APP_VERSION} © {AppConstants.COPYRIGHT_YEAR}',
                 halign='center',
-                pos_hint={'center_x': 0.5, 'y': 0.02},
+                pos_hint={'center_x': 0.5, 'y': 0.03},
                 size_hint_y=None,
                 height=dp(20),
                 font_style='Caption',
-                theme_text_color='Hint',
+                bold=True,
+                theme_text_color='Custom',
+                text_color=(0.36, 0.46, 0.60, 1),
             )
         )
         screen.add_widget(layout)
@@ -5414,6 +5436,9 @@ class StockApp(MDApp):
             self.notify('Mot de passe incorrect', 'error')
 
     def show_change_password_dialog_login(self, instance):
+        if getattr(self, 'is_seller_mode', False):
+            self.notify('Action non autorisée en mode Vendeur.', 'error')
+            return
         content = MDBoxLayout(
             orientation='vertical',
             spacing=dp(10),
@@ -5562,7 +5587,7 @@ class StockApp(MDApp):
 
         actions_hdr = MDBoxLayout(orientation='horizontal', adaptive_width=True, spacing=dp(8), pos_hint={'center_y': 0.5})
         actions_hdr.add_widget(self._ui_icon_pill('cog-outline', (1, 1, 1, 0.16), (1, 1, 1, 1), on_release=lambda x: self.open_settings_menu(), size_dp=40, radius=20, icon_size='21sp'))
-        actions_hdr.add_widget(self._ui_icon_pill('logout', (0.95, 0.25, 0.25, 0.35), (1, 1, 1, 1), on_release=lambda x: self.logout(), size_dp=40, radius=20, icon_size='21sp'))
+        actions_hdr.add_widget(self._ui_icon_pill('logout', (0.86, 0.16, 0.18, 1), (1, 1, 1, 1), on_release=lambda x: self.logout(), size_dp=40, radius=20, icon_size='21sp', border_color=(1, 1, 1, 0.30)))
         self.dash_toolbar.add_widget(actions_hdr)
 
         layout.add_widget(self.dash_toolbar)
@@ -5673,7 +5698,8 @@ class StockApp(MDApp):
             for attr_name in (
                 'lbl_stat_caisse', 'lbl_stat_sales', 'lbl_stat_in', 'lbl_stat_purchases',
                 'lbl_stat_out', 'lbl_stat_profit', 'lbl_stat_expenses',
-                'lbl_stat_stock_val', 'lbl_stat_client_debts', 'lbl_stat_supplier_dues',
+                'lbl_stat_stock_val', 'lbl_stat_stock_sale',
+                'lbl_stat_client_debts', 'lbl_stat_supplier_dues',
             ):
                 setattr(self, attr_name, None)
 
@@ -5834,7 +5860,7 @@ class StockApp(MDApp):
                 self.btn_stats_toggle.add_widget(MDBoxLayout())
                 self.stats_card_container.add_widget(self.btn_stats_toggle)
 
-                self.stats_more_container = MDBoxLayout(orientation='vertical', spacing=dp(10), adaptive_height=True)
+                self.stats_more_container = MDBoxLayout(orientation='vertical', spacing=dp(12), adaptive_height=True)
                 stats_grid = MDGridLayout(cols=2, spacing=dp(10), adaptive_height=True)
                 stats_grid.add_widget(_stat_card('cart-outline', 'Ventes Nettes', 'lbl_stat_sales', (0.91, 0.95, 1, 1), (0.06, 0.4, 0.82, 1)))
                 stats_grid.add_widget(_stat_card('cash-plus', 'Encaissements', 'lbl_stat_in', (0.91, 0.98, 0.92, 1), (0.04, 0.58, 0.22, 1)))
@@ -5842,13 +5868,34 @@ class StockApp(MDApp):
                 stats_grid.add_widget(_stat_card('cash-minus', 'Décaissements', 'lbl_stat_out', (1, 0.92, 0.92, 1), (0.82, 0.12, 0.12, 1)))
                 stats_grid.add_widget(_stat_card('chart-line-variant', 'Bénéfice Net', 'lbl_stat_profit', (0.95, 0.91, 1, 1), (0.48, 0.12, 0.72, 1)))
                 stats_grid.add_widget(_stat_card('cash-remove', 'Dépenses', 'lbl_stat_expenses', (1, 0.94, 0.89, 1), (0.85, 0.35, 0, 1)))
-                stats_grid.add_widget(_stat_card('account-cash', 'Créances Clients', 'lbl_stat_client_debts', (0.91, 0.99, 0.93, 1), (0.04, 0.58, 0.22, 1)))
-                stats_grid.add_widget(_stat_card('account-credit-card', 'Dettes Fourniss.', 'lbl_stat_supplier_dues', (1, 0.91, 0.91, 1), (0.8, 0.08, 0.08, 1)))
                 self.stats_more_container.add_widget(stats_grid)
 
-                stock_card = _stat_card('package-variant', 'Stock (Coût)', 'lbl_stat_stock_val', (0.92, 0.97, 0.97, 1), (0, 0.5, 0.52, 1))
-                stock_card.height = dp(82)
-                self.stats_more_container.add_widget(stock_card)
+                self.stats_more_container.add_widget(MDSeparator(height=dp(1), color=(0.86, 0.88, 0.93, 1)))
+
+                global_box = MDCard(
+                    orientation='vertical',
+                    radius=[16],
+                    md_bg_color=(0.95, 0.96, 0.98, 1),
+                    line_color=(0.85, 0.88, 0.94, 1),
+                    line_width=1,
+                    elevation=0,
+                    size_hint_y=None,
+                    adaptive_height=True,
+                    padding=[dp(10), dp(10)],
+                    spacing=dp(8),
+                )
+                global_hdr = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(22), spacing=dp(6), padding=[dp(2), 0])
+                global_hdr.add_widget(MDIcon(icon='earth', theme_text_color='Custom', text_color=(0.35, 0.40, 0.50, 1), font_size='16sp', size_hint=(None, None), size=(dp(18), dp(18)), pos_hint={'center_y': 0.5}))
+                global_hdr.add_widget(MDLabel(text='Situation Globale', font_style='Caption', bold=True, theme_text_color='Custom', text_color=(0.35, 0.40, 0.50, 1), valign='middle', shorten=True))
+                global_box.add_widget(global_hdr)
+
+                global_grid = MDGridLayout(cols=2, spacing=dp(10), adaptive_height=True)
+                global_grid.add_widget(_stat_card('account-cash', 'Créances Clients', 'lbl_stat_client_debts', (0.91, 0.99, 0.93, 1), (0.04, 0.58, 0.22, 1)))
+                global_grid.add_widget(_stat_card('account-credit-card', 'Dettes Fourniss.', 'lbl_stat_supplier_dues', (1, 0.91, 0.91, 1), (0.8, 0.08, 0.08, 1)))
+                global_grid.add_widget(_stat_card('package-variant', 'Stock (Achat)', 'lbl_stat_stock_val', (0.92, 0.97, 0.97, 1), (0, 0.5, 0.52, 1)))
+                global_grid.add_widget(_stat_card('tag-multiple-outline', 'Stock (Vente)', 'lbl_stat_stock_sale', (0.91, 0.95, 1, 1), (0.09, 0.44, 0.84, 1)))
+                global_box.add_widget(global_grid)
+                self.stats_more_container.add_widget(global_box)
 
             if self.main_dash_content.parent is not None:
                 self.main_dash_content.parent.scroll_y = 1.0
@@ -5949,6 +5996,8 @@ class StockApp(MDApp):
             self.lbl_stat_expenses.text = FinancialEngine.format_money(st['expenses'])
         if getattr(self, 'lbl_stat_stock_val', None):
             self.lbl_stat_stock_val.text = FinancialEngine.format_money(st['stock_value_cost'])
+        if getattr(self, 'lbl_stat_stock_sale', None):
+            self.lbl_stat_stock_sale.text = FinancialEngine.format_money(st['stock_value_sale'])
         if getattr(self, 'lbl_stat_client_debts', None):
             self.lbl_stat_client_debts.text = FinancialEngine.format_money(st['client_debts'])
         if getattr(self, 'lbl_stat_supplier_dues', None):
@@ -6430,7 +6479,9 @@ class StockApp(MDApp):
             q = self.search_field.get_value().strip() if hasattr(self, 'search_field') and self.search_field else ''
             fam = getattr(self, 'selected_family_filter', AppConstants.FAM_ALL)
             doc_type = AppConstants.MODE_TO_DOC.get(self.current_mode, AppConstants.DOC_BV)
-            allow_virtual = doc_type in (AppConstants.DOC_BV, AppConstants.DOC_FC, AppConstants.DOC_FP, AppConstants.DOC_DP, AppConstants.DOC_RC)
+            allow_virtual = (self.current_mode != 'manage_products') and (
+                doc_type in (AppConstants.DOC_BV, AppConstants.DOC_FC, AppConstants.DOC_FP, AppConstants.DOC_DP, AppConstants.DOC_RC, AppConstants.DOC_BS)
+            )
             include_def = allow_virtual and self.current_page_offset == 0 and not q and fam == AppConstants.FAM_ALL
 
             rows = self.db.get_products(
@@ -6476,7 +6527,7 @@ class StockApp(MDApp):
                 stock_bg = [0.91, 0.97, 0.92, 1]
 
                 if is_virt:
-                    price_fmt = 'Prix Libre'
+                    price_fmt = 'Qté Libre' if is_qty_only else 'Prix Libre'
                     price_col = [0, 0.4, 0.8, 1]
                     icon_name = 'pencil-plus'
                     icon_col = [0, 0.4, 0.8, 1]
@@ -9852,6 +9903,11 @@ class StockApp(MDApp):
         )
 
     def open_note_input(self, instance):
+        if getattr(self, 'note_dialog', None):
+            try:
+                self.note_dialog.dismiss()
+            except Exception:
+                pass
         content = MDBoxLayout(orientation='vertical', spacing=dp(12), size_hint_y=None, adaptive_height=True, padding=[0, dp(4), 0, 0])
         note_card = MDCard(orientation='vertical', size_hint=(1, None), height=dp(70), radius=[12], elevation=0, md_bg_color=(0.96, 0.97, 0.99, 1), line_color=(0.86, 0.88, 0.93, 1), line_width=1, padding=[dp(12), dp(4)])
         nf = SmartTextField(text=self.temp_note, hint_text='Note (optionnel)', icon_right='note-text-outline', pos_hint={'center_y': 0.5})
@@ -9861,22 +9917,22 @@ class StockApp(MDApp):
         def _save_n(x):
             self.temp_note = nf.get_value().strip()
             self.btn_note_icon.md_bg_color = (0, 0.6, 0.2, 1) if self.temp_note else (0.22, 0.24, 0.28, 1)
-            ndlg.dismiss()
+            self.note_dialog.dismiss()
 
         def _clear_n(x):
             self.temp_note = ''
             self.btn_note_icon.md_bg_color = (0.22, 0.24, 0.28, 1)
-            ndlg.dismiss()
+            self.note_dialog.dismiss()
 
         btns = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint=(1, None), height=dp(46))
-        btns.add_widget(self._ui_card_btn('ANNULER', (0.92, 0.93, 0.95, 1), text_color=(0.35, 0.35, 0.4, 1), size_hint_x=0.35, height=46, on_release=lambda x: ndlg.dismiss()))
+        btns.add_widget(self._ui_card_btn('ANNULER', (0.92, 0.93, 0.95, 1), text_color=(0.35, 0.35, 0.4, 1), size_hint_x=0.35, height=46, on_release=lambda x: self.note_dialog.dismiss()))
         btns.add_widget(self._ui_icon_pill('trash-can-outline', (1, 0.93, 0.93, 1), (0.82, 0.14, 0.14, 1), on_release=_clear_n, border_color=(0.94, 0.78, 0.78, 1), size_dp=46, radius=12))
         btns.add_widget(self._ui_card_btn('OK', (0.0, 0.62, 0.25, 1), icon='check-circle-outline', size_hint_x=0.65, height=46, elevation=1, on_release=_save_n))
         content.add_widget(btns)
 
-        ndlg = MDDialog(title='Ajouter une note', type='custom', content_cls=content, size_hint=(0.92, None), radius=[18, 18, 18, 18], buttons=[])
-        self._fit_dialog(ndlg)
-        ndlg.open()
+        self.note_dialog = MDDialog(title='Ajouter une note', type='custom', content_cls=content, size_hint=(0.92, None), radius=[18, 18, 18, 18], buttons=[])
+        self._fit_dialog(self.note_dialog)
+        self.note_dialog.open()
         Clock.schedule_once(lambda dt: setattr(nf, 'focus', True), 0.25)
 
     def submit_simple_payment(self, x):
@@ -11919,7 +11975,13 @@ class StockApp(MDApp):
         self.is_detecting_frame = False
         self.is_scanner_paused = False
         self.scanner_sound_enabled = getattr(self, 'scanner_sound_enabled', True)
-        self._current_zoom = 1.0
+        try:
+            saved_zoom = float(self.db.get_setting('scanner_zoom', '1.0') or 1.0)
+            if not math.isfinite(saved_zoom) or saved_zoom < 1.0:
+                saved_zoom = 1.0
+        except Exception:
+            saved_zoom = 1.0
+        self._current_zoom = saved_zoom
         self._zoom_initialized = False
         self._zoom_ratios = []
         self._torch_active = False
@@ -12001,15 +12063,31 @@ class StockApp(MDApp):
                         self._zoom_ratios = [int(r) for r in ratios_raw.toArray()]
                     else:
                         self._zoom_ratios = []
+                    max_ratio = max(self._zoom_ratios) if self._zoom_ratios else 100
                     if not self._zoom_initialized:
                         self._zoom_initialized = True
-                        self._current_zoom = 1.0
+                        if self._current_zoom > 1.0 and self._zoom_ratios and max_ratio >= 150:
+                            z_clamped = min(self._current_zoom, max_ratio / 100.0)
+                            self._current_zoom = z_clamped
+                            target_hundred = int(round(z_clamped * 100))
+                            best_idx = 0
+                            best_diff = 999999
+                            for idx, r_val in enumerate(self._zoom_ratios):
+                                d = abs(r_val - target_hundred)
+                                if d < best_diff:
+                                    best_diff = d
+                                    best_idx = idx
+                            params.setZoom(best_idx)
+                            params_changed = True
+                        elif max_ratio < 150:
+                            self._current_zoom = 1.0
                     if getattr(self, 'btn_scan_zoom', None):
-                        if self._zoom_ratios and max(self._zoom_ratios) >= 150:
+                        if self._zoom_ratios and max_ratio >= 150:
                             self.btn_scan_zoom.opacity = 1
                             self.btn_scan_zoom.disabled = False
                             z_val = self._current_zoom
                             self.btn_scan_zoom.text = f'{int(z_val)}x' if float(z_val).is_integer() else f'{z_val:.1f}x'
+                            self.btn_scan_zoom.md_bg_color = (0.15, 0.45, 0.85, 0.85) if z_val > 1.0 else (0.15, 0.15, 0.18, 0.75)
                         else:
                             self.btn_scan_zoom.opacity = 0
                             self.btn_scan_zoom.disabled = True
@@ -12109,6 +12187,7 @@ class StockApp(MDApp):
             params.setZoom(best_idx)
             acam.setParameters(params)
             self._current_zoom = target
+            self.db.set_setting('scanner_zoom', str(target))
             if getattr(self, 'btn_scan_zoom', None):
                 self.btn_scan_zoom.text = f'{int(target)}x' if float(target).is_integer() else f'{target:.1f}x'
                 self.btn_scan_zoom.md_bg_color = (0.15, 0.45, 0.85, 0.85) if target > 1.0 else (0.15, 0.15, 0.18, 0.75)
@@ -12866,6 +12945,16 @@ class StockApp(MDApp):
             (1, 1, 1, 1),
             lambda x: [self.settings_menu_dialog.dismiss(), Clock.schedule_once(lambda dt: self.open_seller_auth_dialog(), 0.12)],
         )
+        if not self.is_seller_mode:
+            _add_action_row(
+                sec_card,
+                'Mot de passe de connexion',
+                'Changer / Définir le mot de passe',
+                'key-change',
+                (0.09, 0.44, 0.84, 1),
+                (1, 1, 1, 1),
+                lambda x: [self.settings_menu_dialog.dismiss(), Clock.schedule_once(lambda dt: self.show_change_password_dialog_login(None), 0.12)],
+            )
         content.add_widget(sec_card)
 
         # 6. Carte Mise à jour & Version
@@ -14064,6 +14153,218 @@ class StockApp(MDApp):
         self.dialog.open()
 
     def import_data_dialog(self):
+        if getattr(self, '_import_in_progress', False):
+            return
+        if getattr(self, 'import_diag', None):
+            try:
+                self.import_diag.dismiss()
+            except Exception:
+                pass
+            self.import_diag = None
+
+        excel_files = self._list_excel_files()
+
+        def _fmt_size(sz: int) -> str:
+            if sz < 1024:
+                return f'{sz} o'
+            if sz < 1024 * 1024:
+                return f'{sz / 1024:.1f} Ko'
+            return f'{sz / (1024 * 1024):.2f} Mo'
+
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(560), Window.height * 0.80),
+            padding=[0, dp(2), 0, 0],
+        )
+
+        dir_card = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(42),
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0.94, 0.97, 1, 1),
+            line_color=(0.80, 0.88, 0.97, 1),
+            line_width=1,
+            padding=[dp(10), 0],
+            spacing=dp(8),
+        )
+        dir_card.add_widget(
+            MDIcon(
+                icon='folder-outline',
+                theme_text_color='Custom',
+                text_color=(0.09, 0.44, 0.84, 1),
+                font_size='20sp',
+                size_hint=(None, None),
+                size=(dp(22), dp(22)),
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        dir_card.add_widget(
+            MDLabel(
+                text=f'Dossier : Téléchargements ({len(excel_files)} fichier(s) .xlsx)',
+                font_style='Caption',
+                bold=True,
+                theme_text_color='Custom',
+                text_color=(0.08, 0.35, 0.72, 1),
+                shorten=True,
+                valign='middle',
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        content.add_widget(dir_card)
+
+        scroll = MDScrollView(size_hint_y=1, bar_width=dp(3))
+        lst = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(8), padding=[0, dp(2), dp(2), dp(4)])
+
+        if not excel_files:
+            empty_card = MDCard(
+                orientation='vertical',
+                size_hint=(1, None),
+                height=dp(150),
+                radius=[14],
+                elevation=0,
+                md_bg_color=(0.97, 0.98, 0.99, 1),
+                line_color=(0.88, 0.90, 0.94, 1),
+                line_width=1,
+                padding=dp(16),
+                spacing=dp(8),
+            )
+            empty_card.add_widget(MDBoxLayout())
+            empty_card.add_widget(MDIcon(icon='file-excel', theme_text_color='Hint', font_size='38sp', halign='center', pos_hint={'center_x': 0.5}))
+            empty_card.add_widget(MDLabel(text='Aucun fichier .xlsx trouvé dans Téléchargements.', halign='center', font_style='Subtitle2', bold=True, theme_text_color='Secondary', adaptive_height=True))
+            empty_card.add_widget(MDBoxLayout())
+            lst.add_widget(empty_card)
+        else:
+            for it in excel_files:
+                dt_str = datetime.fromtimestamp(it['mtime']).strftime('%d/%m/%Y %H:%M') if it['mtime'] > 0 else ''
+                sub_txt = f"{dt_str}  •  {_fmt_size(it['size'])}" if dt_str else _fmt_size(it['size'])
+
+                card = MDCard(
+                    orientation='horizontal',
+                    size_hint=(1, None),
+                    height=dp(66),
+                    radius=[12],
+                    elevation=0,
+                    md_bg_color=(1, 1, 1, 1),
+                    line_color=(0.88, 0.90, 0.94, 1),
+                    line_width=1,
+                    padding=[dp(10), dp(8)],
+                    spacing=dp(10),
+                    ripple_behavior=True,
+                    on_release=lambda x, f=it: self._select_excel_item_for_import(f),
+                )
+                card.add_widget(
+                    self._ui_icon_pill(
+                        'file-excel',
+                        (0.91, 0.98, 0.93, 1),
+                        (0.06, 0.58, 0.25, 1),
+                        size_dp=42,
+                        radius=11,
+                        icon_size='22sp',
+                    )
+                )
+                info = MDBoxLayout(orientation='vertical', size_hint_x=1, adaptive_height=True, spacing=dp(2), pos_hint={'center_y': 0.5})
+                info.add_widget(
+                    MDLabel(
+                        text=it['name'],
+                        font_style='Subtitle2',
+                        bold=True,
+                        theme_text_color='Primary',
+                        shorten=True,
+                        shorten_from='center',
+                        adaptive_height=True,
+                    )
+                )
+                info.add_widget(
+                    MDLabel(
+                        text=sub_txt,
+                        font_style='Caption',
+                        theme_text_color='Secondary',
+                        adaptive_height=True,
+                    )
+                )
+                card.add_widget(info)
+                card.add_widget(
+                    MDIcon(
+                        icon='file-import',
+                        theme_text_color='Custom',
+                        text_color=(0.09, 0.44, 0.84, 1),
+                        font_size='21sp',
+                        size_hint=(None, None),
+                        size=(dp(24), dp(24)),
+                        pos_hint={'center_y': 0.5},
+                    )
+                )
+                lst.add_widget(card)
+
+        scroll.add_widget(lst)
+        content.add_widget(scroll)
+
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint=(1, None), height=dp(48))
+        btns.add_widget(
+            self._ui_card_btn(
+                'ANNULER',
+                (0.92, 0.93, 0.95, 1),
+                text_color=(0.35, 0.35, 0.4, 1),
+                size_hint_x=0.36,
+                font_size='12.5sp',
+                on_release=lambda x: self.import_diag.dismiss() if getattr(self, 'import_diag', None) else None,
+            )
+        )
+        btns.add_widget(
+            self._ui_card_btn(
+                'AUTRE FICHIER',
+                (0.09, 0.44, 0.84, 1),
+                icon='folder-open-outline',
+                size_hint_x=0.64,
+                font_size='12.5sp',
+                elevation=1,
+                on_release=lambda x: self._open_external_import_picker(),
+            )
+        )
+        content.add_widget(btns)
+
+        self.import_diag = MDDialog(
+            title='Importer Produits (.xlsx)',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.95, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
+        self._fit_dialog(self.import_diag, top_pad=16, side_pad=14, bottom_pad=12, spacer_top=8)
+        self.import_diag.open()
+        Clock.schedule_once(lambda dt: setattr(scroll, 'scroll_y', 1.0), 0.05)
+
+    def _select_excel_item_for_import(self, item: dict):
+        if getattr(self, 'import_diag', None):
+            try:
+                self.import_diag.dismiss()
+            except Exception:
+                pass
+            self.import_diag = None
+
+        filepath = item.get('path', '')
+        uri = item.get('uri')
+        if filepath and os.path.exists(filepath):
+            self._pre_process_import([filepath])
+        elif uri is not None:
+            self.notify('Lecture du fichier Excel en cours...', 'info')
+            threading.Thread(target=self._copy_excel_uri_worker, args=(uri,), daemon=True).start()
+        else:
+            self.notify('Fichier introuvable.', 'error')
+
+    def _open_external_import_picker(self):
+        if getattr(self, 'import_diag', None):
+            try:
+                self.import_diag.dismiss()
+            except Exception:
+                pass
+            self.import_diag = None
+
         if platform == 'android':
             try:
                 from android import activity
@@ -14071,7 +14372,7 @@ class StockApp(MDApp):
 
                 intent_cls = autoclass('android.content.Intent')
                 intent = intent_cls(intent_cls.ACTION_GET_CONTENT)
-                intent.setType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                intent.setType('*/*')
                 intent.addCategory(intent_cls.CATEGORY_OPENABLE)
                 activity.bind(on_activity_result=self._on_android_excel_chosen)
                 cast('android.app.Activity', PythonActivity.mActivity).startActivityForResult(intent, 101)
@@ -14095,6 +14396,7 @@ class StockApp(MDApp):
         self._fit_dialog(self.import_diag)
         self.import_diag.open()
 
+
     def _on_android_excel_chosen(self, req_code, res_code, intent):
         from android import activity
         activity.unbind(on_activity_result=self._on_android_excel_chosen)
@@ -14103,10 +14405,13 @@ class StockApp(MDApp):
             threading.Thread(target=self._copy_excel_uri_worker, args=(uri,), daemon=True).start()
 
     def _copy_excel_uri_worker(self, uri):
+        stream = None
         try:
             from jnius import cast
             cur_act = cast('android.app.Activity', PythonActivity.mActivity)
             stream = cur_act.getContentResolver().openInputStream(uri)
+            if stream is None:
+                raise ValueError("Impossible d'ouvrir le fichier sélectionné.")
             temp_path = os.path.join(self.user_data_dir, 'temp_import.xlsx')
             with open(temp_path, 'wb') as out:
                 buf = bytearray(8192)
@@ -14115,10 +14420,15 @@ class StockApp(MDApp):
                     if n == -1:
                         break
                     out.write(buf[:n])
-            stream.close()
             Clock.schedule_once(lambda dt: self._pre_process_import([temp_path]), 0)
         except Exception as exc:
             Clock.schedule_once(lambda dt, e=exc: self.notify(f'Erreur lecture Excel : {e}', 'error'), 0)
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
     def _pre_process_import(self, selection):
         if not selection:
@@ -14806,7 +15116,7 @@ class StockApp(MDApp):
                 progress_cb(32, 'Compression base de données...', force=True)
 
             with zipfile.ZipFile(stage_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-                zf.write(temp_db, arcname=AppConstants.DB_NAME)
+                zf.write(temp_db, arcname=AppConstants.DB_NAME, compress_type=zipfile.ZIP_DEFLATED)
                 done_bytes += db_sz
                 if progress_cb:
                     progress_cb(32 + int(66 * min(1.0, done_bytes / total_bytes)), 'Compression base de données...', force=True)
@@ -14814,12 +15124,13 @@ class StockApp(MDApp):
                 total_media = len(media_files)
                 for idx, (full_p, arc_n, sz) in enumerate(media_files, start=1):
                     if os.path.exists(full_p):
-                        zf.write(full_p, arcname=arc_n)
+                        comp = zipfile.ZIP_STORED if arc_n.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')) else zipfile.ZIP_DEFLATED
+                        zf.write(full_p, arcname=arc_n, compress_type=comp)
                     done_bytes += sz
                     if progress_cb:
                         progress_cb(
                             32 + int(66 * min(1.0, done_bytes / total_bytes)),
-                            f'Compression médias ({idx}/{total_media})...',
+                            f'Ajout médias ({idx}/{total_media})...',
                             force=(idx == total_media),
                         )
 
@@ -14840,15 +15151,14 @@ class StockApp(MDApp):
                 except Exception:
                     pass
 
-    def perform_local_backup(self, backup_type: str = 'manual'):
+    def perform_local_backup(self, backup_type: str = 'manual', _retry: int = 0):
         if backup_type == 'manual':
-            if getattr(self, '_backup_in_progress', False):
-                return
-            self._backup_in_progress = True
-            now = datetime.now()
-            fname = f"MagPro_Backup_{now.strftime('%Y-%m-%d_%H-%M-%S')}.zip"
-            self._show_backup_progress_dialog(fname)
-            threading.Thread(target=self._backup_worker, args=(fname,), daemon=True).start()
+            if getattr(self, 'settings_menu_dialog', None) and self.settings_menu_dialog.parent:
+                self.settings_menu_dialog.dismiss()
+                if _retry < 5:
+                    Clock.schedule_once(lambda dt: self.perform_local_backup('manual', _retry + 1), 0.10)
+                    return
+            self.show_local_backup_dialog()
             return
 
         try:
@@ -14866,6 +15176,269 @@ class StockApp(MDApp):
             self._rotate_backups(bdir)
         except Exception:
             pass
+
+    def show_local_backup_dialog(self):
+        if getattr(self, '_backup_in_progress', False):
+            return
+        if getattr(self, 'dialog', None):
+            try:
+                self.dialog.dismiss()
+            except Exception:
+                pass
+            self.dialog = None
+
+        def _fmt_size(sz: int) -> str:
+            if sz < 1024:
+                return f'{sz} o'
+            if sz < 1024 * 1024:
+                return f'{sz / 1024:.1f} Ko'
+            return f'{sz / (1024 * 1024):.2f} Mo'
+
+        def _list_backups() -> list:
+            bdir = self.get_backup_directory()
+            search_dirs = [bdir]
+            dl_bdir = os.path.join(self.get_unified_path(''), 'MagPro_Backups')
+            if os.path.abspath(dl_bdir) != os.path.abspath(bdir) and os.path.exists(dl_bdir):
+                search_dirs.append(dl_bdir)
+
+            backups = []
+            seen_paths = set()
+            for d in search_dirs:
+                if not os.path.exists(d):
+                    continue
+                try:
+                    for fn in os.listdir(d):
+                        if fn.startswith('.') or fn.startswith('temp_'):
+                            continue
+                        if not fn.lower().endswith(('.zip', '.db')):
+                            continue
+                        fp = os.path.join(d, fn)
+                        ap = os.path.abspath(fp)
+                        if ap in seen_paths or not os.path.isfile(fp):
+                            continue
+                        seen_paths.add(ap)
+                        backups.append((fp, fn, os.path.getmtime(fp), os.path.getsize(fp)))
+                except Exception:
+                    pass
+            backups.sort(key=lambda item: item[2], reverse=True)
+            return backups
+
+        content = MDBoxLayout(
+            orientation='vertical',
+            spacing=dp(10),
+            size_hint_y=None,
+            height=min(dp(560), Window.height * 0.80),
+            padding=[0, dp(2), 0, 0],
+        )
+
+        dir_card = MDCard(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=dp(42),
+            radius=[10],
+            elevation=0,
+            md_bg_color=(0.95, 0.92, 1, 1),
+            line_color=(0.82, 0.75, 0.94, 1),
+            line_width=1,
+            padding=[dp(10), 0],
+            spacing=dp(8),
+        )
+        dir_card.add_widget(
+            MDIcon(
+                icon='folder-clock-outline',
+                theme_text_color='Custom',
+                text_color=(0.45, 0.2, 0.72, 1),
+                font_size='20sp',
+                size_hint=(None, None),
+                size=(dp(22), dp(22)),
+                pos_hint={'center_y': 0.5},
+            )
+        )
+        lbl_count = MDLabel(
+            text='Dossier : MagPro_Backups',
+            font_style='Caption',
+            bold=True,
+            theme_text_color='Custom',
+            text_color=(0.38, 0.16, 0.62, 1),
+            shorten=True,
+            valign='middle',
+            pos_hint={'center_y': 0.5},
+        )
+        dir_card.add_widget(lbl_count)
+        content.add_widget(dir_card)
+
+        scroll = MDScrollView(size_hint_y=1, bar_width=dp(3))
+        lst = MDBoxLayout(orientation='vertical', adaptive_height=True, spacing=dp(8), padding=[0, dp(2), dp(2), dp(4)])
+        scroll.add_widget(lst)
+        content.add_widget(scroll)
+
+        def _confirm_delete_backup(fp: str, fn: str):
+            def _do_del():
+                try:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                    self.notify(f'Sauvegarde supprimée : {fn}', 'success')
+                    _populate_backup_list()
+                except Exception as exc:
+                    self.notify(f'Erreur suppression : {exc}', 'error')
+
+            self.confirm_del_dialog = self._ui_confirm_dialog(
+                title='Confirmer la suppression',
+                message=f"Voulez-vous vraiment supprimer la sauvegarde '{fn}' ?",
+                confirm_text='SUPPRIMER',
+                icon='trash-can-outline',
+                confirm_icon='trash-can-outline',
+                on_confirm=_do_del,
+            )
+
+        def _populate_backup_list():
+            lst.clear_widgets()
+            backups = _list_backups()
+            lbl_count.text = f'Dossier : MagPro_Backups ({len(backups)})'
+
+            if not backups:
+                empty_card = MDCard(
+                    orientation='vertical',
+                    size_hint=(1, None),
+                    height=dp(150),
+                    radius=[14],
+                    elevation=0,
+                    md_bg_color=(0.97, 0.98, 0.99, 1),
+                    line_color=(0.88, 0.90, 0.94, 1),
+                    line_width=1,
+                    padding=dp(16),
+                    spacing=dp(8),
+                )
+                empty_card.add_widget(MDBoxLayout())
+                empty_card.add_widget(MDIcon(icon='archive-off-outline', theme_text_color='Hint', font_size='38sp', halign='center', pos_hint={'center_x': 0.5}))
+                empty_card.add_widget(MDLabel(text='Aucune sauvegarde trouvée dans MagPro_Backups.', halign='center', font_style='Subtitle2', bold=True, theme_text_color='Secondary', adaptive_height=True))
+                empty_card.add_widget(MDBoxLayout())
+                lst.add_widget(empty_card)
+            else:
+                for fp, fn, mtime, sz in backups:
+                    is_zip = fn.lower().endswith('.zip')
+                    mime = 'application/zip' if is_zip else 'application/octet-stream'
+                    dt_str = datetime.fromtimestamp(mtime).strftime('%d/%m/%Y %H:%M')
+                    ico_col = (0.45, 0.2, 0.72, 1) if is_zip else (0.0, 0.52, 0.62, 1)
+                    ico_bg = (0.95, 0.92, 1, 1) if is_zip else (0.90, 0.97, 0.99, 1)
+
+                    card = MDCard(
+                        orientation='horizontal',
+                        size_hint=(1, None),
+                        height=dp(66),
+                        radius=[12],
+                        elevation=0,
+                        md_bg_color=(1, 1, 1, 1),
+                        line_color=(0.88, 0.90, 0.94, 1),
+                        line_width=1,
+                        padding=[dp(10), dp(8)],
+                        spacing=dp(8),
+                        ripple_behavior=True,
+                        on_release=lambda x, p=fp, m=mime: self._share_or_open_exported_file(p, None, m, action='share'),
+                    )
+                    card.add_widget(
+                        self._ui_icon_pill(
+                            'folder-zip-outline' if is_zip else 'database-outline',
+                            ico_bg,
+                            ico_col,
+                            size_dp=42,
+                            radius=11,
+                            icon_size='22sp',
+                        )
+                    )
+                    info = MDBoxLayout(orientation='vertical', size_hint_x=1, adaptive_height=True, spacing=dp(2), pos_hint={'center_y': 0.5})
+                    info.add_widget(
+                        MDLabel(
+                            text=fn,
+                            font_style='Subtitle2',
+                            bold=True,
+                            theme_text_color='Primary',
+                            shorten=True,
+                            shorten_from='center',
+                            adaptive_height=True,
+                        )
+                    )
+                    info.add_widget(
+                        MDLabel(
+                            text=f'{dt_str}  •  {_fmt_size(sz)}',
+                            font_style='Caption',
+                            theme_text_color='Secondary',
+                            adaptive_height=True,
+                        )
+                    )
+                    card.add_widget(info)
+                    card.add_widget(
+                        self._ui_icon_pill(
+                            'share-variant',
+                            (0.90, 0.95, 1, 1),
+                            (0.09, 0.44, 0.84, 1),
+                            on_release=lambda x, p=fp, m=mime: self._share_or_open_exported_file(p, None, m, action='share'),
+                            size_dp=34,
+                            radius=10,
+                            icon_size='18sp',
+                        )
+                    )
+                    card.add_widget(
+                        self._ui_icon_pill(
+                            'trash-can-outline',
+                            (1, 0.93, 0.93, 1),
+                            (0.82, 0.14, 0.14, 1),
+                            on_release=lambda x, p=fp, n=fn: _confirm_delete_backup(p, n),
+                            size_dp=34,
+                            radius=10,
+                            icon_size='18sp',
+                        )
+                    )
+                    lst.add_widget(card)
+
+            Clock.schedule_once(lambda dt: setattr(scroll, 'scroll_y', 1.0), 0.05)
+
+        _populate_backup_list()
+
+        btns = MDBoxLayout(orientation='horizontal', spacing=dp(8), size_hint=(1, None), height=dp(48))
+        btns.add_widget(
+            self._ui_card_btn(
+                'FERMER',
+                (0.92, 0.93, 0.95, 1),
+                text_color=(0.35, 0.35, 0.4, 1),
+                size_hint_x=0.35,
+                font_size='12.5sp',
+                on_release=lambda x: self.dialog.dismiss() if getattr(self, 'dialog', None) else None,
+            )
+        )
+        btns.add_widget(
+            self._ui_card_btn(
+                'SAUVEGARDER (.zip)',
+                (0.45, 0.2, 0.72, 1),
+                icon='database-export',
+                size_hint_x=0.65,
+                font_size='12.5sp',
+                elevation=1,
+                on_release=lambda x: self._start_manual_backup(on_done=_populate_backup_list),
+            )
+        )
+        content.add_widget(btns)
+
+        self.dialog = MDDialog(
+            title='Sauvegarde Locale (.zip)',
+            type='custom',
+            content_cls=content,
+            size_hint=(0.95, None),
+            radius=[18, 18, 18, 18],
+            buttons=[],
+        )
+        self._fit_dialog(self.dialog, top_pad=16, side_pad=14, bottom_pad=12, spacer_top=8)
+        self.dialog.open()
+
+    def _start_manual_backup(self, on_done=None):
+        if getattr(self, '_backup_in_progress', False):
+            return
+        self._backup_in_progress = True
+        self._backup_on_done = on_done
+        now = datetime.now()
+        fname = f"MagPro_Backup_{now.strftime('%Y-%m-%d_%H-%M-%S')}.zip"
+        self._show_backup_progress_dialog(fname)
+        threading.Thread(target=self._backup_worker, args=(fname,), daemon=True).start()
 
     def _show_backup_progress_dialog(self, filename: str):
         from kivymd.uix.progressbar import MDProgressBar
@@ -15007,6 +15580,42 @@ class StockApp(MDApp):
             zip_path = os.path.join(bdir, fname)
             self._write_backup_zip(zip_path, progress_cb=_push_ui)
             self._rotate_backups(bdir)
+
+            if platform == 'android' and PythonActivity is not None:
+                is_private_dir = ('Android/data' in bdir) or os.path.abspath(bdir).startswith(os.path.abspath(self.user_data_dir))
+                if is_private_dir:
+                    try:
+                        from jnius import autoclass
+                        version_cls = autoclass('android.os.Build$VERSION')
+                        if version_cls.SDK_INT >= 29:
+                            MediaStoreDownloads = autoclass('android.provider.MediaStore$Downloads')
+                            MediaColumns = autoclass('android.provider.MediaStore$MediaColumns')
+                            ContentValues = autoclass('android.content.ContentValues')
+                            Environment = autoclass('android.os.Environment')
+
+                            values = ContentValues()
+                            values.put(MediaColumns.DISPLAY_NAME, str(fname))
+                            values.put(MediaColumns.MIME_TYPE, 'application/zip')
+                            values.put(MediaColumns.RELATIVE_PATH, f'{Environment.DIRECTORY_DOWNLOADS}/MagPro_Backups')
+
+                            resolver = PythonActivity.mActivity.getContentResolver()
+                            uri = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
+                            if uri is not None:
+                                out_stream = resolver.openOutputStream(uri)
+                                if out_stream is not None:
+                                    try:
+                                        with open(zip_path, 'rb') as f:
+                                            while True:
+                                                chunk = f.read(16384)
+                                                if not chunk:
+                                                    break
+                                                out_stream.write(chunk)
+                                        out_stream.flush()
+                                    finally:
+                                        out_stream.close()
+                    except Exception:
+                        pass
+
             Clock.schedule_once(lambda dt: self._finish_backup_ui(fname, None), 0.12)
         except Exception as exc:
             Clock.schedule_once(lambda dt, e=str(exc): self._finish_backup_ui(None, e), 0)
@@ -15021,14 +15630,37 @@ class StockApp(MDApp):
         self._backup_progress_widgets = None
         self._backup_in_progress = False
 
+        on_done = getattr(self, '_backup_on_done', None)
+        self._backup_on_done = None
+
         if error_msg or not fname:
             self.notify(f'Erreur sauvegarde : {error_msg or "échec"}', 'error')
         else:
             self.notify(f'Sauvegarde enregistrée : {fname}', 'success')
+            if on_done and getattr(self, 'dialog', None) and self.dialog.parent:
+                try:
+                    on_done()
+                except Exception:
+                    pass
 
     def trigger_auto_backups(self, dt=None):
-        self.perform_local_backup('daily')
-        self.perform_local_backup('rolling')
+        lock = getattr(self, '_auto_backup_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._auto_backup_lock = lock
+
+        def _auto_worker():
+            if not lock.acquire(blocking=False):
+                return
+            try:
+                self.perform_local_backup('daily')
+                self.perform_local_backup('rolling')
+            except Exception:
+                pass
+            finally:
+                lock.release()
+
+        threading.Thread(target=_auto_worker, daemon=True).start()
 
     def share_database_file(self):
         if getattr(self, '_share_in_progress', False):
