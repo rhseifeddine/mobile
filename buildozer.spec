@@ -7,7 +7,7 @@ source.include_exts = py,png,jpg,kv,atlas,json,ttf
 version = 8.1.0
 requirements = python3,kivy,kivymd==1.2.0,requests,urllib3,pillow,arabic-reshaper,python-bidi==0.4.2,six,future,certifi,chardet,idna,pyzbar,libzbar,fpdf2,fonttools==4.38.0,defusedxml,openpyxl,et_xmlfile,jdcal,android,jnius
 icon.filename = apk_icon.png
-presplash.filename = %(source.dir)s/apk_icon.png
+presplash.filename = %(source.dir)s/apk_presplash.png
 android.presplash_color = #FFFFFF
 orientation = portrait
 fullscreen = 0
