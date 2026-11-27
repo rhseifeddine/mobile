@@ -4451,17 +4451,43 @@ class StockApp(MDApp):
             rv.refresh_from_data()
             rv.scroll_y = 1.0
 
-            def _sync_top(*_):
+            lm = getattr(rv, 'layout_manager', None)
+
+            def _compute_scrollable_h() -> float:
+                if lm is None or rv.height <= 0:
+                    return 0.0
+                c_h = max(float(getattr(lm, 'height', 0) or 0), float(getattr(lm, 'minimum_height', 0) or 0))
+                if c_h <= 0 and new_data:
+                    item_h = float(lm.default_size[1] or dp(88))
+                    sp = float(lm.spacing or 0)
+                    pad = lm.padding or [0, 0, 0, 0]
+                    pad_y = float(pad[1]) + float(pad[3]) if len(pad) >= 4 else 0.0
+                    c_h = pad_y + len(new_data) * item_h + max(0, len(new_data) - 1) * sp
+                return max(0.0, c_h - float(rv.height))
+
+            def _apply_top(*_):
                 if getattr(rv, '_scroll_gen', 0) != gen:
                     return
+                scrollable_h = _compute_scrollable_h()
+                eff = getattr(rv, 'effect_y', None)
+                if eff is not None:
+                    eff.velocity = 0.0
+                    eff.min = -scrollable_h
+                    eff.max = 0.0
+                    eff.value = -scrollable_h
                 rv.scroll_y = 1.0
-                if getattr(rv, 'effect_y', None):
-                    rv.effect_y.velocity = 0.0
-                    rv.effect_y.value = rv.effect_y.min
+                if hasattr(rv, 'refresh_from_viewport'):
+                    rv.refresh_from_viewport()
+
+            def _release_top(*_):
+                if getattr(rv, '_scroll_gen', 0) != gen:
+                    return
+                _apply_top()
                 rv._restoring_scroll = False
                 rv.loading_lock = False
 
-            Clock.schedule_once(_sync_top, 0)
+            Clock.schedule_once(_apply_top, 0)
+            Clock.schedule_once(_release_top, 0.06)
             return
 
         if not new_data:
@@ -8701,7 +8727,7 @@ class StockApp(MDApp):
                     self.current_method_index = idx
                     break
 
-        target_h = min(dp(585 if self.show_tax_details else 550), Window.height * 0.88)
+        target_h = min(dp(605 if self.show_tax_details else 550), Window.height * 0.88)
         content = MDBoxLayout(orientation='vertical', spacing=dp(9), size_hint_y=None, height=target_h, padding=[0, 0, 0, dp(2)])
 
         header_box = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(38), spacing=dp(8))
@@ -8742,7 +8768,7 @@ class StockApp(MDApp):
         total_card = MDCard(
             orientation='vertical',
             size_hint=(1, None),
-            height=dp(106 if self.show_tax_details else 80),
+            adaptive_height=True,
             radius=[14],
             md_bg_color=(0.94, 0.97, 1, 1),
             line_color=(0.76, 0.85, 0.96, 1),
@@ -8759,18 +8785,75 @@ class StockApp(MDApp):
         top_tot.add_widget(MDLabel(text='Toucher = tout payer', halign='right', font_style='Caption', theme_text_color='Custom', text_color=(0.35, 0.52, 0.72, 1)))
         total_card.add_widget(top_tot)
 
-        self.lbl_final_total = MDLabel(text='', halign='center', valign='middle', font_style='H5', font_size='26sp', bold=True, theme_text_color='Custom', text_color=(0.08, 0.12, 0.18, 1))
+        self.lbl_final_total = MDLabel(text='', halign='center', valign='middle', font_style='H5', font_size='26sp', bold=True, theme_text_color='Custom', text_color=(0.08, 0.12, 0.18, 1), size_hint_y=None, height=dp(36))
         total_card.add_widget(self.lbl_final_total)
 
         if self.show_tax_details:
-            det_box = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(20), spacing=dp(4))
-            self.lbl_pay_ht = MDLabel(text='', theme_text_color='Secondary', font_style='Caption', font_size='11sp', halign='left', bold=True, size_hint_x=0.34, shorten=True)
-            self.lbl_timbre = MDLabel(text='', theme_text_color='Custom', text_color=(0.5, 0, 0.5, 1), font_style='Caption', font_size='11sp', halign='center', bold=True, size_hint_x=0.33, shorten=True)
-            self.lbl_pay_tva = MDLabel(text='', theme_text_color='Custom', text_color=(0.8, 0.1, 0.1, 1), font_style='Caption', font_size='11sp', halign='right', bold=True, size_hint_x=0.33, shorten=True)
+            total_card.add_widget(MDSeparator(height=dp(1), color=(0.82, 0.88, 0.96, 1)))
+            det_box = MDBoxLayout(orientation='horizontal', size_hint_y=None, height=dp(20), spacing=dp(8))
+            self.lbl_pay_ht = MDLabel(
+                text='',
+                theme_text_color='Secondary',
+                font_style='Caption',
+                font_size='11.5sp',
+                halign='left',
+                valign='middle',
+                bold=True,
+                size_hint_x=0.52,
+                max_lines=1,
+            )
+            self.lbl_pay_tva = MDLabel(
+                text='',
+                theme_text_color='Custom',
+                text_color=(0.8, 0.1, 0.1, 1),
+                font_style='Caption',
+                font_size='11.5sp',
+                halign='right',
+                valign='middle',
+                bold=True,
+                size_hint_x=0.48,
+                max_lines=1,
+            )
+
+            def _fit_ht_tva(*_):
+                if det_box.width <= 0:
+                    return
+                avail = max(dp(40), det_box.width - det_box.spacing)
+                for sp_val in (11.5, 10.5, 9.5, 8.5):
+                    self.lbl_pay_ht.font_size = f'{sp_val}sp'
+                    self.lbl_pay_tva.font_size = f'{sp_val}sp'
+                    self.lbl_pay_ht.text_size = (None, None)
+                    self.lbl_pay_tva.text_size = (None, None)
+                    self.lbl_pay_ht.texture_update()
+                    self.lbl_pay_tva.texture_update()
+                    if (self.lbl_pay_ht.texture_size[0] + self.lbl_pay_tva.texture_size[0]) <= avail:
+                        break
+                self.lbl_pay_ht.text_size = (self.lbl_pay_ht.width, None)
+                self.lbl_pay_tva.text_size = (self.lbl_pay_tva.width, None)
+
+            det_box.bind(width=_fit_ht_tva)
+            self.lbl_pay_ht.bind(text=_fit_ht_tva)
+            self.lbl_pay_tva.bind(text=_fit_ht_tva)
+            Clock.schedule_once(_fit_ht_tva, 0)
             det_box.add_widget(self.lbl_pay_ht)
-            det_box.add_widget(self.lbl_timbre)
             det_box.add_widget(self.lbl_pay_tva)
             total_card.add_widget(det_box)
+
+            self.lbl_timbre = MDLabel(
+                text='',
+                theme_text_color='Custom',
+                text_color=(0.5, 0, 0.5, 1),
+                font_style='Caption',
+                font_size='11.5sp',
+                halign='center',
+                valign='middle',
+                bold=True,
+                size_hint_y=None,
+                height=0,
+                opacity=0,
+                max_lines=1,
+            )
+            total_card.add_widget(self.lbl_timbre)
         else:
             self.lbl_pay_ht = None
             self.lbl_timbre = None
@@ -8897,8 +8980,14 @@ class StockApp(MDApp):
         if self.lbl_pay_tva:
             self.lbl_pay_tva.text = f"TVA : {FinancialEngine.format_money(calc['total_tva_final'])}"
         if self.lbl_timbre:
-            self.lbl_timbre.text = f"Timbre : {FinancialEngine.format_money(calc['stamp_duty'])}" if calc['show_stamp_duty_widget'] else ''
-            self.lbl_timbre.opacity = 1 if calc['show_stamp_duty_widget'] else 0
+            if calc['show_stamp_duty_widget']:
+                self.lbl_timbre.text = f"Droit de timbre : {FinancialEngine.format_money(calc['stamp_duty'])}"
+                self.lbl_timbre.height = dp(18)
+                self.lbl_timbre.opacity = 1
+            else:
+                self.lbl_timbre.text = ''
+                self.lbl_timbre.height = 0
+                self.lbl_timbre.opacity = 0
 
         self.lbl_final_total.text = FinancialEngine.format_money(self.current_final_total)
         paid = FinancialEngine.to_decimal(self.txt_paid.text or '0')
@@ -10146,9 +10235,7 @@ class StockApp(MDApp):
                 'icon_color': [0.5, 0.5, 0.5, 1], 'bg_color': [1, 1, 1, 1],
                 'op_id': None, 'is_transfer': False,
             }]
-        self.rv_entity_history.data = formatted
-        self.rv_entity_history.scroll_y = 1.0
-        self.rv_entity_history.refresh_from_data()
+        self._preserve_rv_scroll_on_append(self.rv_entity_history, formatted, reset=True)
 
     # --------------------------------------------------------------------------
     # 7.9 DÉPENSES / CHARGES (CLAVIER NUMÉRIQUE + CATÉGORIES ENRICHIES)
@@ -16379,6 +16466,3 @@ if __name__ == '__main__':
                     f.write(err_msg)
             except Exception:
                 pass
-
-
-
